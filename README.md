@@ -87,6 +87,13 @@ Have questions or want to contribute? We'd love to hear from you!
 	<tbody>
 		<tr>
             <td align="center">
+                <a href="https://github.com/felger1115">
+                    <img src="https://avatars.githubusercontent.com/u/188569487?v=4" width="100;" alt="felger1115"/>
+                    <br />
+                    <sub><b>felger</b></sub>
+                </a>
+            </td>
+            <td align="center">
                 <a href="https://github.com/zhom">
                     <img src="https://avatars.githubusercontent.com/u/2717306?v=4" width="100;" alt="zhom"/>
                     <br />
