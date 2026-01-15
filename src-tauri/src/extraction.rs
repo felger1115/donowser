@@ -1,10 +1,10 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
-use tauri::Emitter;
 
 use crate::browser::BrowserType;
 use crate::downloader::DownloadProgress;
+use crate::events;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
@@ -36,6 +36,8 @@ impl Extractor {
     // Determine browser type from the destination directory path
     let browser_type = if dest_dir.to_string_lossy().contains("camoufox") {
       "camoufox"
+    } else if dest_dir.to_string_lossy().contains("wayfern") {
+      "wayfern"
     } else if dest_dir.to_string_lossy().contains("firefox") {
       "firefox"
     } else if dest_dir.to_string_lossy().contains("zen") {
@@ -45,9 +47,9 @@ impl Extractor {
       return Ok(());
     };
 
-    // For Camoufox on Linux, we expect the executable directly under version directory
-    // e.g., binaries/camoufox/<version>/camoufox, without an extra camoufox/ subdirectory
-    if browser_type == "camoufox" {
+    // For Camoufox and Wayfern on Linux, we expect the executable directly under version directory
+    // e.g., binaries/camoufox/<version>/camoufox, without an extra subdirectory
+    if browser_type == "camoufox" || browser_type == "wayfern" {
       return Ok(());
     }
 
@@ -98,7 +100,7 @@ impl Extractor {
 
   pub async fn extract_browser(
     &self,
-    app_handle: &tauri::AppHandle,
+    _app_handle: &tauri::AppHandle,
     browser_type: BrowserType,
     version: &str,
     archive_path: &Path,
@@ -115,7 +117,7 @@ impl Extractor {
       eta_seconds: None,
       stage: "extracting".to_string(),
     };
-    let _ = app_handle.emit("download-progress", &progress);
+    let _ = events::emit("download-progress", &progress);
 
     log::info!(
       "Starting extraction of {} for browser {} version {}",
@@ -1011,6 +1013,10 @@ impl Extractor {
       "camoufox",
       "camoufox-bin",
       "camoufox-browser",
+      // Wayfern variants
+      "wayfern",
+      "wayfern-bin",
+      "wayfern-browser",
     ];
 
     // First, try direct lookup in the main directory
@@ -1036,6 +1042,7 @@ impl Extractor {
       "brave",
       "zen",
       "camoufox",
+      "wayfern",
       ".",
       "./",
       "firefox",
@@ -1141,6 +1148,7 @@ impl Extractor {
               || name_lower.contains("brave")
               || name_lower.contains("zen")
               || name_lower.contains("camoufox")
+              || name_lower.contains("wayfern")
               || name_lower.ends_with(".appimage")
               || !name_lower.contains('.')
             {
@@ -1196,6 +1204,7 @@ impl Extractor {
               || name_lower.contains("brave")
               || name_lower.contains("zen")
               || name_lower.contains("camoufox")
+              || name_lower.contains("wayfern")
               || file_name.ends_with(".AppImage")
             {
               log::info!(

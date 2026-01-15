@@ -3,11 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::Emitter;
 
 use crate::api_client::ApiClient;
 use crate::browser::{create_browser, BrowserType};
 use crate::browser_version_manager::DownloadInfo;
+use crate::events;
 
 // Global state to track currently downloading browser-version pairs
 lazy_static::lazy_static! {
@@ -168,6 +168,43 @@ impl Downloader {
           ))?;
 
         Ok(asset_url)
+      }
+      BrowserType::Wayfern => {
+        // For Wayfern, get the download URL from version.json
+        let version_info = self
+          .api_client
+          .fetch_wayfern_version_with_caching(true)
+          .await?;
+
+        // Verify requested version matches available version
+        if version_info.version != version {
+          return Err(
+            format!(
+              "Wayfern version {version} not found. Available version: {}",
+              version_info.version
+            )
+            .into(),
+          );
+        }
+
+        // Get the download URL for current platform
+        let download_url = self
+          .api_client
+          .get_wayfern_download_url(&version_info)
+          .ok_or_else(|| {
+            let (os, arch) = Self::get_platform_info();
+            format!(
+              "No compatible download found for Wayfern on {os}/{arch}. Available platforms: {}",
+              version_info
+                .downloads
+                .iter()
+                .filter_map(|(k, v)| if v.is_some() { Some(k.as_str()) } else { None })
+                .collect::<Vec<_>>()
+                .join(", ")
+            )
+          })?;
+
+        Ok(download_url)
       }
       _ => {
         // For other browsers, use the provided URL
@@ -350,9 +387,53 @@ impl Downloader {
     }
   }
 
+  /// Ensure version.json exists in the Camoufox installation directory.
+  /// Creates the file if it doesn't exist, using the version from the tag name.
+  async fn ensure_camoufox_version_json(
+    &self,
+    browser_dir: &Path,
+    version: &str,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The browser_dir is typically: binaries/camoufox/<version>/
+    // Find the executable directory within it
+    let version_json_locations = vec![
+      browser_dir.join("version.json"),
+      browser_dir.join("camoufox").join("version.json"),
+    ];
+
+    // Check if version.json already exists in any expected location
+    for location in &version_json_locations {
+      if location.exists() {
+        log::info!("version.json already exists at: {}", location.display());
+        return Ok(());
+      }
+    }
+
+    // Parse the Firefox version from the Camoufox version tag
+    // Format: "135.0.1-beta.24" -> Firefox version is "135.0.1" (or just "135.0")
+    let firefox_version = version.split('-').next().unwrap_or(version);
+
+    // Create version.json in the browser directory
+    let version_json_path = browser_dir.join("version.json");
+    let version_data = serde_json::json!({
+      "version": firefox_version
+    });
+
+    let version_json_str = serde_json::to_string_pretty(&version_data)?;
+    tokio::fs::write(&version_json_path, version_json_str).await?;
+
+    log::info!(
+      "Created version.json at {} with Firefox version: {}",
+      version_json_path.display(),
+      firefox_version
+    );
+
+    Ok(())
+  }
+
   pub async fn download_browser<R: tauri::Runtime>(
     &self,
-    app_handle: &tauri::AppHandle<R>,
+    _app_handle: &tauri::AppHandle<R>,
     browser_type: BrowserType,
     version: &str,
     download_info: &DownloadInfo,
@@ -480,7 +561,7 @@ impl Downloader {
       stage: initial_stage,
     };
 
-    let _ = app_handle.emit("download-progress", &progress);
+    let _ = events::emit("download-progress", &progress);
 
     // Open file in append mode (resuming) or create new
     use std::fs::OpenOptions;
@@ -539,7 +620,7 @@ impl Downloader {
           stage: stage_description,
         };
 
-        let _ = app_handle.emit("download-progress", &progress);
+        let _ = events::emit("download-progress", &progress);
         last_update = now;
       }
     }
@@ -554,6 +635,11 @@ impl Downloader {
     browser_str: String,
     version: String,
   ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // Check if Wayfern terms have been accepted before allowing any browser downloads
+    if !crate::wayfern_terms::WayfernTermsManager::instance().is_terms_accepted() {
+      return Err("Please accept Wayfern Terms and Conditions before downloading browsers".into());
+    }
+
     // Check if this browser-version pair is already being downloaded
     let download_key = format!("{browser_str}-{version}");
     {
@@ -715,7 +801,7 @@ impl Downloader {
       eta_seconds: None,
       stage: "verifying".to_string(),
     };
-    let _ = app_handle.emit("download-progress", &progress);
+    let _ = events::emit("download-progress", &progress);
 
     // Verify the browser was downloaded correctly
     log::info!("Verifying download for browser: {browser_str}, version: {version}");
@@ -809,7 +895,7 @@ impl Downloader {
       }
     }
 
-    // If this is Camoufox, automatically download GeoIP database
+    // If this is Camoufox, automatically download GeoIP database and create version.json
     if browser_str == "camoufox" {
       // Check if GeoIP database is already available
       if !crate::geoip_downloader::GeoIPDownloader::is_geoip_database_available() {
@@ -831,6 +917,15 @@ impl Downloader {
       } else {
         log::info!("GeoIP database already available");
       }
+
+      // Create version.json if it doesn't exist
+      if let Err(e) = self
+        .ensure_camoufox_version_json(&browser_dir, &version)
+        .await
+      {
+        log::warn!("Failed to create version.json for Camoufox: {e}");
+        // Don't fail the download if version.json creation fails
+      }
     }
 
     // Emit completion
@@ -844,7 +939,7 @@ impl Downloader {
       eta_seconds: Some(0.0),
       stage: "completed".to_string(),
     };
-    let _ = app_handle.emit("download-progress", &progress);
+    let _ = events::emit("download-progress", &progress);
 
     // Remove browser-version pair from downloading set
     {

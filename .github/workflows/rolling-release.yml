@@ -19,7 +19,6 @@ jobs:
         --skip-git
         --lockfile=pnpm-lock.yaml
         --lockfile=src-tauri/Cargo.lock
-        --lockfile=nodecar/pnpm-lock.yaml
         ./
     permissions:
       security-events: write
@@ -70,37 +69,26 @@ jobs:
             arch: "aarch64"
             target: "aarch64-apple-darwin"
             pkg_target: "latest-macos-arm64"
-            nodecar_script: "build:mac-aarch64"
           - platform: "macos-latest"
             args: "--target x86_64-apple-darwin --verbose"
             arch: "x86_64"
             target: "x86_64-apple-darwin"
             pkg_target: "latest-macos-x64"
-            nodecar_script: "build:mac-x86_64"
           - platform: "ubuntu-22.04"
             args: "--target x86_64-unknown-linux-gnu --verbose"
             arch: "x86_64"
             target: "x86_64-unknown-linux-gnu"
             pkg_target: "latest-linux-x64"
-            nodecar_script: "build:linux-x64"
           - platform: "ubuntu-22.04-arm"
             args: "--target aarch64-unknown-linux-gnu --verbose"
             arch: "aarch64"
             target: "aarch64-unknown-linux-gnu"
             pkg_target: "latest-linux-arm64"
-            nodecar_script: "build:linux-arm64"
           - platform: "windows-latest"
             args: "--target x86_64-pc-windows-msvc --verbose"
             arch: "x86_64"
             target: "x86_64-pc-windows-msvc"
             pkg_target: "latest-win-x64"
-            nodecar_script: "build:win-x64"
-          # - platform: "windows-11-arm"
-          #   args: "--target aarch64-pc-windows-msvc --verbose"
-          #   arch: "aarch64"
-          #   target: "aarch64-pc-windows-msvc"
-          #   pkg_target: "latest-win-arm64"
-          #   nodecar_script: "build:win-arm64"
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -127,38 +115,15 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04' || matrix.platform == 'ubuntu-22.04-arm'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xdg-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev pkg-config xdg-utils
 
       - name: Rust cache
         uses: swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 #v2.8.2
         with:
           workdir: ./src-tauri
 
-      - name: Install banderole
-        run: cargo install banderole
-
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
-
-      - name: Build nodecar sidecar
-        shell: bash
-        working-directory: ./nodecar
-        run: |
-          pnpm run ${{ matrix.nodecar_script }}
-
-      - name: Copy nodecar binary to Tauri binaries
-        shell: bash
-        run: |
-          mkdir -p src-tauri/binaries
-          if [[ "${{ matrix.platform }}" == "windows-latest" ]]; then
-            cp nodecar/nodecar-bin src-tauri/binaries/nodecar-${{ matrix.target }}.exe
-          else
-            cp nodecar/nodecar-bin src-tauri/binaries/nodecar-${{ matrix.target }}
-          fi
-
-      # - name: Download Camoufox for testing
-      #   run: npx camoufox-js fetch
-      #   continue-on-error: true
 
       - name: Build frontend
         run: pnpm exec next build
@@ -175,20 +140,25 @@ jobs:
           echo "Checking from src-tauri perspective:"
           ls -la src-tauri/../dist || echo "Warning: dist not accessible from src-tauri"
 
-      - name: Build donut-proxy sidecar
+      - name: Build sidecar binaries
         shell: bash
         working-directory: ./src-tauri
-        run: cargo build --bin donut-proxy --target ${{ matrix.target }} --release
+        run: |
+          cargo build --bin donut-proxy --target ${{ matrix.target }} --release
+          cargo build --bin donut-daemon --target ${{ matrix.target }} --release
 
-      - name: Copy donut-proxy binary to Tauri binaries
+      - name: Copy sidecar binaries to Tauri binaries
         shell: bash
         run: |
           mkdir -p src-tauri/binaries
           if [[ "${{ matrix.platform }}" == "windows-latest" ]]; then
             cp src-tauri/target/${{ matrix.target }}/release/donut-proxy.exe src-tauri/binaries/donut-proxy-${{ matrix.target }}.exe
+            cp src-tauri/target/${{ matrix.target }}/release/donut-daemon.exe src-tauri/binaries/donut-daemon-${{ matrix.target }}.exe
           else
             cp src-tauri/target/${{ matrix.target }}/release/donut-proxy src-tauri/binaries/donut-proxy-${{ matrix.target }}
+            cp src-tauri/target/${{ matrix.target }}/release/donut-daemon src-tauri/binaries/donut-daemon-${{ matrix.target }}
             chmod +x src-tauri/binaries/donut-proxy-${{ matrix.target }}
+            chmod +x src-tauri/binaries/donut-daemon-${{ matrix.target }}
           fi
 
       - name: Generate nightly timestamp
@@ -201,7 +171,7 @@ jobs:
           echo "Generated timestamp: ${TIMESTAMP}-${COMMIT_HASH}"
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@19b93bb55601e3e373a93cfb6eb4242e45f5af20 #v0.6.0
+        uses: tauri-apps/tauri-action@73fb865345c54760d875b94642314f8c0c894afa #v0.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BUILD_TAG: "nightly-${{ steps.timestamp.outputs.timestamp }}"

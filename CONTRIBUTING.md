@@ -31,12 +31,25 @@ When you submit your first pull request, you acknowledge that you agree to the t
 
 ## Development Setup
 
+### Using Nix
+
+If you have [Nix](https://nixos.org/) installed, you can skip the manual setup below and simply run:
+
+```bash
+nix develop
+# or if you use direnv
+direnv allow
+```
+
+This will provide Node.js, Rust, and all necessary system libraries.
+
+### Manual Setup
+
 Ensure you have the following dependencies installed:
 
 - Node.js (see `.node-version` for exact version)
 - pnpm package manager
 - Latest Rust and Cargo toolchain
-- [Banderole](https://github.com/zhom/banderole)
 - [Tauri prerequisites guide](https://v2.tauri.app/start/prerequisites/).
 
 ## Run Locally
@@ -57,16 +70,7 @@ After having the above dependencies installed, proceed through the following ste
    pnpm install
    ```
 
-4. **Build nodecar**
-
-   Building nodecar requires you to have `banderole` installed.
-
-   ```bash
-   cd nodecar
-   pnpm build
-   ```
-
-5. **Start the development server**
+4. **Start the development server**
 
    ```bash
    pnpm tauri dev

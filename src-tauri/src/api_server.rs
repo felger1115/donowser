@@ -1,5 +1,7 @@
 use crate::browser::ProxySettings;
 use crate::camoufox_manager::CamoufoxConfig;
+use crate::daemon_ws::{ws_handler, WsState};
+use crate::events;
 use crate::group_manager::GROUP_MANAGER;
 use crate::profile::manager::ProfileManager;
 use crate::proxy_manager::PROXY_MANAGER;
@@ -15,7 +17,6 @@ use axum::{
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::Emitter;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 use tower_http::cors::CorsLayer;
@@ -60,6 +61,8 @@ pub struct CreateProfileRequest {
   pub release_type: Option<String>,
   #[schema(value_type = Object)]
   pub camoufox_config: Option<serde_json::Value>,
+  #[schema(value_type = Object)]
+  pub wayfern_config: Option<serde_json::Value>,
   pub group_id: Option<String>,
   pub tags: Option<Vec<String>>,
 }
@@ -274,7 +277,7 @@ impl ApiServer {
         let random_port = rand::random::<u16>().saturating_add(10000);
         match TcpListener::bind(format!("127.0.0.1:{random_port}")).await {
           Ok(listener) => {
-            let _ = app_handle.emit(
+            let _ = events::emit(
               "api-port-conflict",
               format!("API server using fallback port {random_port}"),
             );
@@ -320,13 +323,22 @@ impl ApiServer {
 
     let api = ApiDoc::openapi();
 
-    let v1_routes = v1_routes.layer(middleware::from_fn_with_state(
-      state.clone(),
-      auth_middleware,
-    ));
+    let v1_routes = v1_routes
+      .layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth_middleware,
+      ))
+      .layer(middleware::from_fn(terms_check_middleware));
+
+    // Create WebSocket route with its own state (no auth required for daemon IPC)
+    let ws_state = WsState::new();
+    let ws_routes = Router::new()
+      .route("/events", get(ws_handler))
+      .with_state(ws_state);
 
     let app = Router::new()
       .nest("/v1", v1_routes)
+      .nest("/ws", ws_routes)
       .route("/openapi.json", get(move || async move { Json(api) }))
       .layer(CorsLayer::permissive())
       .with_state(state);
@@ -359,6 +371,19 @@ impl ApiServer {
     self.port = None;
     Ok(())
   }
+}
+
+// Terms and Conditions check middleware
+async fn terms_check_middleware(
+  request: axum::extract::Request,
+  next: Next,
+) -> Result<Response, StatusCode> {
+  // Check if Wayfern terms have been accepted
+  if !crate::wayfern_terms::WayfernTermsManager::instance().is_terms_accepted() {
+    return Err(StatusCode::FORBIDDEN);
+  }
+
+  Ok(next.run(request).await)
 }
 
 // Authentication middleware
@@ -560,6 +585,13 @@ async fn create_profile(
     None
   };
 
+  // Parse wayfern config if provided
+  let wayfern_config = if let Some(config) = &request.wayfern_config {
+    serde_json::from_value(config.clone()).ok()
+  } else {
+    None
+  };
+
   // Create profile using the async create_profile_with_group method
   match profile_manager
     .create_profile_with_group(
@@ -570,6 +602,7 @@ async fn create_profile(
       request.release_type.as_deref().unwrap_or("stable"),
       request.proxy_id.clone(),
       camoufox_config,
+      wayfern_config,
       request.group_id.clone(),
     )
     .await

@@ -1,21 +1,23 @@
 use crate::browser::{create_browser, BrowserType, ProxySettings};
 use crate::camoufox_manager::{CamoufoxConfig, CamoufoxManager};
 use crate::downloaded_browsers_registry::DownloadedBrowsersRegistry;
+use crate::events;
 use crate::platform_browser;
 use crate::profile::{BrowserProfile, ProfileManager};
 use crate::proxy_manager::PROXY_MANAGER;
+use crate::wayfern_manager::{WayfernConfig, WayfernManager};
 use directories::BaseDirs;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::System;
-use tauri::Emitter;
 pub struct BrowserRunner {
   base_dirs: BaseDirs,
   pub profile_manager: &'static ProfileManager,
   pub downloaded_browsers_registry: &'static DownloadedBrowsersRegistry,
   auto_updater: &'static crate::auto_updater::AutoUpdater,
   camoufox_manager: &'static CamoufoxManager,
+  wayfern_manager: &'static WayfernManager,
 }
 
 impl BrowserRunner {
@@ -26,6 +28,7 @@ impl BrowserRunner {
       downloaded_browsers_registry: DownloadedBrowsersRegistry::instance(),
       auto_updater: crate::auto_updater::AutoUpdater::instance(),
       camoufox_manager: CamoufoxManager::instance(),
+      wayfern_manager: WayfernManager::instance(),
     }
   }
 
@@ -98,7 +101,7 @@ impl BrowserRunner {
       );
     }
 
-    // Handle camoufox profiles using nodecar launcher
+    // Handle Camoufox profiles using CamoufoxManager
     if profile.browser == "camoufox" {
       // Get or create camoufox config
       let mut camoufox_config = profile.camoufox_config.clone().unwrap_or_else(|| {
@@ -205,14 +208,11 @@ impl BrowserRunner {
         );
       }
 
-      // Use the nodecar camoufox launcher
-      log::info!(
-        "Launching Camoufox via nodecar for profile: {}",
-        profile.name
-      );
+      // Launch Camoufox browser
+      log::info!("Launching Camoufox for profile: {}", profile.name);
       let camoufox_result = self
         .camoufox_manager
-        .launch_camoufox_profile_nodecar(
+        .launch_camoufox_profile(
           app_handle.clone(),
           updated_profile.clone(),
           camoufox_config,
@@ -220,7 +220,7 @@ impl BrowserRunner {
         )
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-          format!("Failed to launch camoufox via nodecar: {e}").into()
+          format!("Failed to launch Camoufox: {e}").into()
         })?;
 
       // For server-based Camoufox, we use the process_id
@@ -261,7 +261,7 @@ impl BrowserRunner {
 
       // Emit profiles-changed to trigger frontend to reload profiles from disk
       // This ensures the UI displays the newly generated fingerprint
-      if let Err(e) = app_handle.emit("profiles-changed", ()) {
+      if let Err(e) = events::emit_empty("profiles-changed") {
         log::warn!("Warning: Failed to emit profiles-changed event: {e}");
       }
 
@@ -271,7 +271,7 @@ impl BrowserRunner {
       );
 
       // Emit profile update event to frontend
-      if let Err(e) = app_handle.emit("profile-updated", &updated_profile) {
+      if let Err(e) = events::emit("profile-updated", &updated_profile) {
         log::warn!("Warning: Failed to emit profile update event: {e}");
       }
 
@@ -287,11 +287,209 @@ impl BrowserRunner {
         is_running: updated_profile.process_id.is_some(),
       };
 
-      if let Err(e) = app_handle.emit("profile-running-changed", &payload) {
+      if let Err(e) = events::emit("profile-running-changed", &payload) {
         log::warn!("Warning: Failed to emit profile running changed event: {e}");
       } else {
         log::info!(
           "Successfully emitted profile-running-changed event for Camoufox {}: running={}",
+          updated_profile.name,
+          payload.is_running
+        );
+      }
+
+      return Ok(updated_profile);
+    }
+
+    // Handle Wayfern profiles using WayfernManager
+    if profile.browser == "wayfern" {
+      // Get or create wayfern config
+      let mut wayfern_config = profile.wayfern_config.clone().unwrap_or_else(|| {
+        log::info!(
+          "No wayfern config found for profile {}, using default",
+          profile.name
+        );
+        WayfernConfig::default()
+      });
+
+      // Always start a local proxy for Wayfern (for traffic monitoring and geoip support)
+      let upstream_proxy = profile
+        .proxy_id
+        .as_ref()
+        .and_then(|id| PROXY_MANAGER.get_proxy_settings_by_id(id));
+
+      log::info!(
+        "Starting local proxy for Wayfern profile: {} (upstream: {})",
+        profile.name,
+        upstream_proxy
+          .as_ref()
+          .map(|p| format!("{}:{}", p.host, p.port))
+          .unwrap_or_else(|| "DIRECT".to_string())
+      );
+
+      // Start the proxy and get local proxy settings
+      // If proxy startup fails, DO NOT launch Wayfern - it requires local proxy
+      let profile_id_str = profile.id.to_string();
+      let local_proxy = PROXY_MANAGER
+        .start_proxy(
+          app_handle.clone(),
+          upstream_proxy.as_ref(),
+          0, // Use 0 as temporary PID, will be updated later
+          Some(&profile_id_str),
+        )
+        .await
+        .map_err(|e| {
+          let error_msg = format!("Failed to start local proxy for Wayfern: {e}");
+          log::error!("{}", error_msg);
+          error_msg
+        })?;
+
+      // Format proxy URL for wayfern - always use HTTP for the local proxy
+      let proxy_url = format!("http://{}:{}", local_proxy.host, local_proxy.port);
+
+      // Set proxy in wayfern config
+      wayfern_config.proxy = Some(proxy_url);
+
+      log::info!(
+        "Configured local proxy for Wayfern: {:?}",
+        wayfern_config.proxy
+      );
+
+      // Check if we need to generate a new fingerprint on every launch
+      let mut updated_profile = profile.clone();
+      if wayfern_config.randomize_fingerprint_on_launch == Some(true) {
+        log::info!(
+          "Generating random fingerprint for Wayfern profile: {}",
+          profile.name
+        );
+
+        // Create a config copy without the existing fingerprint to force generation of a new one
+        let mut config_for_generation = wayfern_config.clone();
+        config_for_generation.fingerprint = None;
+
+        // Generate a new fingerprint
+        let new_fingerprint = self
+          .wayfern_manager
+          .generate_fingerprint_config(&app_handle, profile, &config_for_generation)
+          .await
+          .map_err(|e| format!("Failed to generate random fingerprint: {e}"))?;
+
+        log::info!(
+          "New fingerprint generated, length: {} chars",
+          new_fingerprint.len()
+        );
+
+        // Update the config with the new fingerprint for launching
+        wayfern_config.fingerprint = Some(new_fingerprint.clone());
+
+        // Save the updated fingerprint to the profile so it persists
+        let mut updated_wayfern_config = updated_profile.wayfern_config.clone().unwrap_or_default();
+        updated_wayfern_config.fingerprint = Some(new_fingerprint);
+        updated_wayfern_config.randomize_fingerprint_on_launch = Some(true);
+        if wayfern_config.os.is_some() {
+          updated_wayfern_config.os = wayfern_config.os.clone();
+        }
+        updated_profile.wayfern_config = Some(updated_wayfern_config.clone());
+
+        log::info!(
+          "Updated profile wayfern_config with new fingerprint for profile: {}, fingerprint length: {}",
+          profile.name,
+          updated_wayfern_config.fingerprint.as_ref().map(|f| f.len()).unwrap_or(0)
+        );
+      }
+
+      // Launch Wayfern browser
+      log::info!("Launching Wayfern for profile: {}", profile.name);
+
+      // Get profile path for Wayfern
+      let profiles_dir = self.profile_manager.get_profiles_dir();
+      let profile_data_path = updated_profile.get_profile_data_path(&profiles_dir);
+      let profile_path_str = profile_data_path.to_string_lossy().to_string();
+
+      // Get proxy URL from config
+      let proxy_url = wayfern_config.proxy.as_deref();
+
+      let wayfern_result = self
+        .wayfern_manager
+        .launch_wayfern(
+          &app_handle,
+          &updated_profile,
+          &profile_path_str,
+          &wayfern_config,
+          url.as_deref(),
+          proxy_url,
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+          format!("Failed to launch Wayfern: {e}").into()
+        })?;
+
+      // Get the process ID from launch result
+      let process_id = wayfern_result.processId.unwrap_or(0);
+      log::info!("Wayfern launched successfully with PID: {process_id}");
+
+      // Update profile with the process info
+      updated_profile.process_id = Some(process_id);
+      updated_profile.last_launch = Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
+
+      // Update the proxy manager with the correct PID
+      if let Err(e) = PROXY_MANAGER.update_proxy_pid(0, process_id) {
+        log::warn!("Warning: Failed to update proxy PID mapping: {e}");
+      } else {
+        log::info!("Updated proxy PID mapping from temp (0) to actual PID: {process_id}");
+      }
+
+      // Save the updated profile
+      log::info!(
+        "Saving profile {} with wayfern_config fingerprint length: {}",
+        updated_profile.name,
+        updated_profile
+          .wayfern_config
+          .as_ref()
+          .and_then(|c| c.fingerprint.as_ref())
+          .map(|f| f.len())
+          .unwrap_or(0)
+      );
+      self.save_process_info(&updated_profile)?;
+      let _ = crate::tag_manager::TAG_MANAGER.lock().map(|tm| {
+        let _ = tm.rebuild_from_profiles(&self.profile_manager.list_profiles().unwrap_or_default());
+      });
+      log::info!(
+        "Successfully saved profile with process info: {}",
+        updated_profile.name
+      );
+
+      // Emit profiles-changed to trigger frontend to reload profiles from disk
+      if let Err(e) = events::emit_empty("profiles-changed") {
+        log::warn!("Warning: Failed to emit profiles-changed event: {e}");
+      }
+
+      log::info!(
+        "Emitting profile events for successful Wayfern launch: {}",
+        updated_profile.name
+      );
+
+      // Emit profile update event to frontend
+      if let Err(e) = events::emit("profile-updated", &updated_profile) {
+        log::warn!("Warning: Failed to emit profile update event: {e}");
+      }
+
+      // Emit minimal running changed event to frontend
+      #[derive(Serialize)]
+      struct RunningChangedPayload {
+        id: String,
+        is_running: bool,
+      }
+
+      let payload = RunningChangedPayload {
+        id: updated_profile.id.to_string(),
+        is_running: updated_profile.process_id.is_some(),
+      };
+
+      if let Err(e) = events::emit("profile-running-changed", &payload) {
+        log::warn!("Warning: Failed to emit profile running changed event: {e}");
+      } else {
+        log::info!(
+          "Successfully emitted profile-running-changed event for Wayfern {}: running={}",
           updated_profile.name,
           payload.is_running
         );
@@ -512,7 +710,7 @@ impl BrowserRunner {
     );
 
     // Emit profile update event to frontend
-    if let Err(e) = app_handle.emit("profile-updated", &updated_profile) {
+    if let Err(e) = events::emit("profile-updated", &updated_profile) {
       log::warn!("Warning: Failed to emit profile update event: {e}");
     }
 
@@ -527,7 +725,7 @@ impl BrowserRunner {
       is_running: updated_profile.process_id.is_some(),
     };
 
-    if let Err(e) = app_handle.emit("profile-running-changed", &payload) {
+    if let Err(e) = events::emit("profile-running-changed", &payload) {
       log::warn!("Warning: Failed to emit profile running changed event: {e}");
     } else {
       log::info!(
@@ -547,7 +745,7 @@ impl BrowserRunner {
     url: &str,
     _internal_proxy_settings: Option<&ProxySettings>,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Handle camoufox profiles using nodecar launcher
+    // Handle Camoufox profiles using CamoufoxManager
     if profile.browser == "camoufox" {
       // Get the profile path based on the UUID
       let profiles_dir = self.profile_manager.get_profiles_dir();
@@ -567,9 +765,31 @@ impl BrowserRunner {
             profile.id
           );
 
-          // For Camoufox, we need to launch a new instance with the URL since it doesn't support remote commands
-          // This is a limitation of Camoufox's architecture
-          return Err("Camoufox doesn't support opening URLs in existing instances. Please close the browser and launch again with the URL.".into());
+          // Get Camoufox executable path and use Firefox-like remote mechanism
+          let executable_path = self
+            .get_browser_executable_path(profile)
+            .map_err(|e| format!("Failed to get Camoufox executable path: {e}"))?;
+
+          // Launch Camoufox with -profile and -new-tab to open URL in existing instance
+          // This works because we no longer use -no-remote flag
+          let output = std::process::Command::new(&executable_path)
+            .arg("-profile")
+            .arg(&*profile_path_str)
+            .arg("-new-tab")
+            .arg(url)
+            .output()
+            .map_err(|e| format!("Failed to execute Camoufox: {e}"))?;
+
+          if output.status.success() {
+            log::info!("Successfully opened URL in existing Camoufox instance");
+            return Ok(());
+          } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::warn!("Camoufox -new-tab command failed: {stderr}");
+            return Err(
+              format!("Failed to open URL in existing Camoufox instance: {stderr}").into(),
+            );
+          }
         }
         Ok(None) => {
           return Err("Camoufox browser is not running".into());
@@ -580,7 +800,39 @@ impl BrowserRunner {
       }
     }
 
-    // Use the comprehensive browser status check for non-camoufox browsers
+    // Handle Wayfern profiles using WayfernManager
+    if profile.browser == "wayfern" {
+      let profiles_dir = self.profile_manager.get_profiles_dir();
+      let profile_data_path = profile.get_profile_data_path(&profiles_dir);
+      let profile_path_str = profile_data_path.to_string_lossy();
+
+      // Check if the process is running
+      match self
+        .wayfern_manager
+        .find_wayfern_by_profile(&profile_path_str)
+        .await
+      {
+        Some(_wayfern_process) => {
+          log::info!(
+            "Opening URL in existing Wayfern process for profile: {} (ID: {})",
+            profile.name,
+            profile.id
+          );
+
+          // Use CDP to open URL in a new tab
+          self
+            .wayfern_manager
+            .open_url_in_tab(&profile_path_str, url)
+            .await?;
+          return Ok(());
+        }
+        None => {
+          return Err("Wayfern browser is not running".into());
+        }
+      }
+    }
+
+    // Use the comprehensive browser status check for non-camoufox/wayfern browsers
     let is_running = self
       .check_browser_status(app_handle.clone(), profile)
       .await?;
@@ -657,8 +909,12 @@ impl BrowserRunner {
         return Err("Unsupported platform".into());
       }
       BrowserType::Camoufox => {
-        // Camoufox uses nodecar for launching, URL opening is handled differently
+        // Camoufox URL opening is handled differently
         Err("URL opening in existing Camoufox instance is not supported".into())
+      }
+      BrowserType::Wayfern => {
+        // Wayfern URL opening is handled differently
+        Err("URL opening in existing Wayfern instance is not supported".into())
       }
       BrowserType::Chromium | BrowserType::Brave => {
         #[cfg(target_os = "macos")]
@@ -941,7 +1197,7 @@ impl BrowserRunner {
     app_handle: tauri::AppHandle,
     profile: &BrowserProfile,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Handle camoufox profiles using nodecar launcher
+    // Handle Camoufox profiles using CamoufoxManager
     if profile.browser == "camoufox" {
       // Search by profile path to find the running Camoufox instance
       let profiles_dir = self.profile_manager.get_profiles_dir();
@@ -1338,7 +1594,7 @@ impl BrowserRunner {
       );
 
       // Emit profile update event to frontend
-      if let Err(e) = app_handle.emit("profile-updated", &updated_profile) {
+      if let Err(e) = events::emit("profile-updated", &updated_profile) {
         log::warn!("Warning: Failed to emit profile update event: {e}");
       }
 
@@ -1353,7 +1609,7 @@ impl BrowserRunner {
         is_running: false, // Explicitly set to false since we just killed it
       };
 
-      if let Err(e) = app_handle.emit("profile-running-changed", &payload) {
+      if let Err(e) = events::emit("profile-running-changed", &payload) {
         log::warn!("Warning: Failed to emit profile running changed event: {e}");
       } else {
         log::info!(
@@ -1385,7 +1641,325 @@ impl BrowserRunner {
       return Ok(());
     }
 
-    // For non-camoufox browsers, use the existing logic
+    // Handle Wayfern profiles using WayfernManager
+    if profile.browser == "wayfern" {
+      let profiles_dir = self.profile_manager.get_profiles_dir();
+      let profile_data_path = profile.get_profile_data_path(&profiles_dir);
+      let profile_path_str = profile_data_path.to_string_lossy();
+
+      log::info!(
+        "Attempting to kill Wayfern process for profile: {} (ID: {})",
+        profile.name,
+        profile.id
+      );
+
+      // Stop the proxy associated with this profile first
+      let profile_id_str = profile.id.to_string();
+      if let Err(e) = PROXY_MANAGER
+        .stop_proxy_by_profile_id(app_handle.clone(), &profile_id_str)
+        .await
+      {
+        log::warn!(
+          "Warning: Failed to stop proxy for profile {}: {e}",
+          profile_id_str
+        );
+      }
+
+      let mut process_actually_stopped = false;
+      match self
+        .wayfern_manager
+        .find_wayfern_by_profile(&profile_path_str)
+        .await
+      {
+        Some(wayfern_process) => {
+          log::info!(
+            "Found Wayfern process: {} (PID: {:?})",
+            wayfern_process.id,
+            wayfern_process.processId
+          );
+
+          match self.wayfern_manager.stop_wayfern(&wayfern_process.id).await {
+            Ok(_) => {
+              if let Some(pid) = wayfern_process.processId {
+                // Verify the process actually died by checking after a short delay
+                use tokio::time::{sleep, Duration};
+                sleep(Duration::from_millis(500)).await;
+
+                use sysinfo::{Pid, System};
+                let system = System::new_all();
+                process_actually_stopped = system.process(Pid::from(pid as usize)).is_none();
+
+                if process_actually_stopped {
+                  log::info!(
+                    "Successfully stopped Wayfern process: {} (PID: {:?}) - verified process is dead",
+                    wayfern_process.id,
+                    pid
+                  );
+                } else {
+                  log::warn!(
+                    "Wayfern stop command returned success but process {} (PID: {:?}) is still running - forcing kill",
+                    wayfern_process.id,
+                    pid
+                  );
+                  // Force kill the process
+                  #[cfg(target_os = "macos")]
+                  {
+                    use crate::platform_browser;
+                    if let Err(e) = platform_browser::macos::kill_browser_process_impl(
+                      pid,
+                      Some(&profile_path_str),
+                    )
+                    .await
+                    {
+                      log::error!("Failed to force kill Wayfern process {}: {}", pid, e);
+                    } else {
+                      sleep(Duration::from_millis(500)).await;
+                      let system = System::new_all();
+                      process_actually_stopped = system.process(Pid::from(pid as usize)).is_none();
+                      if process_actually_stopped {
+                        log::info!(
+                          "Successfully force killed Wayfern process {} (PID: {:?})",
+                          wayfern_process.id,
+                          pid
+                        );
+                      }
+                    }
+                  }
+                  #[cfg(target_os = "linux")]
+                  {
+                    use crate::platform_browser;
+                    if let Err(e) = platform_browser::linux::kill_browser_process_impl(pid).await {
+                      log::error!("Failed to force kill Wayfern process {}: {}", pid, e);
+                    } else {
+                      sleep(Duration::from_millis(500)).await;
+                      let system = System::new_all();
+                      process_actually_stopped = system.process(Pid::from(pid as usize)).is_none();
+                      if process_actually_stopped {
+                        log::info!(
+                          "Successfully force killed Wayfern process {} (PID: {:?})",
+                          wayfern_process.id,
+                          pid
+                        );
+                      }
+                    }
+                  }
+                  #[cfg(target_os = "windows")]
+                  {
+                    use crate::platform_browser;
+                    if let Err(e) = platform_browser::windows::kill_browser_process_impl(pid).await
+                    {
+                      log::error!("Failed to force kill Wayfern process {}: {}", pid, e);
+                    } else {
+                      sleep(Duration::from_millis(500)).await;
+                      let system = System::new_all();
+                      process_actually_stopped = system.process(Pid::from(pid as usize)).is_none();
+                      if process_actually_stopped {
+                        log::info!(
+                          "Successfully force killed Wayfern process {} (PID: {:?})",
+                          wayfern_process.id,
+                          pid
+                        );
+                      }
+                    }
+                  }
+                }
+              } else {
+                process_actually_stopped = true;
+              }
+            }
+            Err(e) => {
+              log::error!(
+                "Error stopping Wayfern process {}: {}",
+                wayfern_process.id,
+                e
+              );
+              // Try to force kill if we have a PID
+              if let Some(pid) = wayfern_process.processId {
+                log::info!(
+                  "Attempting force kill after stop_wayfern error for PID: {}",
+                  pid
+                );
+                #[cfg(target_os = "macos")]
+                {
+                  use crate::platform_browser;
+                  if let Err(kill_err) =
+                    platform_browser::macos::kill_browser_process_impl(pid, Some(&profile_path_str))
+                      .await
+                  {
+                    log::error!("Failed to force kill Wayfern process {}: {}", pid, kill_err);
+                  } else {
+                    use tokio::time::{sleep, Duration};
+                    sleep(Duration::from_millis(500)).await;
+                    use sysinfo::{Pid, System};
+                    let system = System::new_all();
+                    process_actually_stopped = system.process(Pid::from(pid as usize)).is_none();
+                  }
+                }
+                #[cfg(target_os = "linux")]
+                {
+                  use crate::platform_browser;
+                  if let Err(kill_err) =
+                    platform_browser::linux::kill_browser_process_impl(pid).await
+                  {
+                    log::error!("Failed to force kill Wayfern process {}: {}", pid, kill_err);
+                  } else {
+                    use tokio::time::{sleep, Duration};
+                    sleep(Duration::from_millis(500)).await;
+                    use sysinfo::{Pid, System};
+                    let system = System::new_all();
+                    process_actually_stopped = system.process(Pid::from(pid as usize)).is_none();
+                  }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                  use crate::platform_browser;
+                  if let Err(kill_err) =
+                    platform_browser::windows::kill_browser_process_impl(pid).await
+                  {
+                    log::error!("Failed to force kill Wayfern process {}: {}", pid, kill_err);
+                  } else {
+                    use tokio::time::{sleep, Duration};
+                    sleep(Duration::from_millis(500)).await;
+                    use sysinfo::{Pid, System};
+                    let system = System::new_all();
+                    process_actually_stopped = system.process(Pid::from(pid as usize)).is_none();
+                  }
+                }
+              }
+            }
+          }
+        }
+        None => {
+          log::info!(
+            "No running Wayfern process found for profile: {} (ID: {})",
+            profile.name,
+            profile.id
+          );
+          process_actually_stopped = true;
+        }
+      }
+
+      // If process wasn't confirmed stopped, return an error
+      if !process_actually_stopped {
+        log::error!(
+          "Failed to stop Wayfern process for profile: {} (ID: {}) - process may still be running",
+          profile.name,
+          profile.id
+        );
+        return Err(
+          format!(
+            "Failed to stop Wayfern process for profile {} - process may still be running",
+            profile.name
+          )
+          .into(),
+        );
+      }
+
+      // Clear the process ID from the profile
+      let mut updated_profile = profile.clone();
+      updated_profile.process_id = None;
+
+      // Check for pending updates and apply them
+      if let Ok(Some(pending_update)) = self
+        .auto_updater
+        .get_pending_update(&profile.browser, &profile.version)
+      {
+        log::info!(
+          "Found pending update for Wayfern profile {}: {} -> {}",
+          profile.name,
+          profile.version,
+          pending_update.new_version
+        );
+
+        match self.profile_manager.update_profile_version(
+          &app_handle,
+          &profile.id.to_string(),
+          &pending_update.new_version,
+        ) {
+          Ok(updated_profile_after_update) => {
+            log::info!(
+              "Successfully updated Wayfern profile {} from version {} to {}",
+              profile.name,
+              profile.version,
+              pending_update.new_version
+            );
+            updated_profile = updated_profile_after_update;
+
+            if let Err(e) = self
+              .auto_updater
+              .dismiss_update_notification(&pending_update.id)
+            {
+              log::warn!("Warning: Failed to dismiss pending update notification: {e}");
+            }
+          }
+          Err(e) => {
+            log::error!(
+              "Failed to apply pending update for Wayfern profile {}: {}",
+              profile.name,
+              e
+            );
+          }
+        }
+      }
+
+      self
+        .save_process_info(&updated_profile)
+        .map_err(|e| format!("Failed to update profile: {e}"))?;
+
+      log::info!(
+        "Emitting profile events for successful Wayfern kill: {}",
+        updated_profile.name
+      );
+
+      // Emit profile update event to frontend
+      if let Err(e) = events::emit("profile-updated", &updated_profile) {
+        log::warn!("Warning: Failed to emit profile update event: {e}");
+      }
+
+      // Emit minimal running changed event
+      #[derive(Serialize)]
+      struct RunningChangedPayload {
+        id: String,
+        is_running: bool,
+      }
+      let payload = RunningChangedPayload {
+        id: updated_profile.id.to_string(),
+        is_running: false,
+      };
+
+      if let Err(e) = events::emit("profile-running-changed", &payload) {
+        log::warn!("Warning: Failed to emit profile running changed event: {e}");
+      } else {
+        log::info!(
+          "Successfully emitted profile-running-changed event for Wayfern {}: running={}",
+          updated_profile.name,
+          payload.is_running
+        );
+      }
+
+      log::info!(
+        "Wayfern process cleanup completed for profile: {} (ID: {})",
+        profile.name,
+        profile.id
+      );
+
+      // Consolidate browser versions after stopping a browser
+      if let Ok(consolidated) = self
+        .downloaded_browsers_registry
+        .consolidate_browser_versions(&app_handle)
+      {
+        if !consolidated.is_empty() {
+          log::info!("Post-stop version consolidation results:");
+          for action in &consolidated {
+            log::info!("  {action}");
+          }
+        }
+      }
+
+      return Ok(());
+    }
+
+    // For non-camoufox/wayfern browsers, use the existing logic
     let pid = if let Some(pid) = profile.process_id {
       // First verify the stored PID is still valid and belongs to our profile
       let system = System::new_all();
@@ -1607,7 +2181,7 @@ impl BrowserRunner {
     );
 
     // Emit profile update event to frontend
-    if let Err(e) = app_handle.emit("profile-updated", &updated_profile) {
+    if let Err(e) = events::emit("profile-updated", &updated_profile) {
       log::warn!("Warning: Failed to emit profile update event: {e}");
     }
 
@@ -1622,7 +2196,7 @@ impl BrowserRunner {
       is_running: false, // Explicitly set to false since we just killed it
     };
 
-    if let Err(e) = app_handle.emit("profile-running-changed", &payload) {
+    if let Err(e) = events::emit("profile-running-changed", &payload) {
       log::warn!("Warning: Failed to emit profile running changed event: {e}");
     } else {
       log::info!(
@@ -1835,9 +2409,9 @@ pub async fn launch_browser_profile(
     profile_for_launch.id
   );
 
-  // Always start a local proxy before launching (non-Camoufox handled here; Camoufox has its own flow)
+  // Always start a local proxy before launching (non-Camoufox/Wayfern handled here; they have their own flow)
   // This ensures all traffic goes through the local proxy for monitoring and future features
-  if profile.browser != "camoufox" {
+  if profile.browser != "camoufox" && profile.browser != "wayfern" {
     // Determine upstream proxy if configured; otherwise use DIRECT (no upstream)
     let upstream_proxy = profile_for_launch
       .proxy_id
@@ -1928,7 +2502,7 @@ pub async fn launch_browser_profile(
       is_running: false,
     };
 
-    if let Err(e) = app_handle.emit("profile-running-changed", &payload) {
+    if let Err(e) = events::emit("profile-running-changed", &payload) {
       log::warn!("Warning: Failed to emit profile running changed event: {e}");
     }
 
@@ -2005,7 +2579,7 @@ pub async fn kill_browser_profile(
         is_running: true,
       };
 
-      if let Err(e) = app_handle.emit("profile-running-changed", &payload) {
+      if let Err(e) = events::emit("profile-running-changed", &payload) {
         log::warn!("Warning: Failed to emit profile running changed event: {e}");
       }
 

@@ -10,7 +10,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import type { BrowserProfile, CamoufoxConfig, CamoufoxOS } from "@/types";
+import { WayfernConfigForm } from "@/components/wayfern-config-form";
+import type {
+  BrowserProfile,
+  CamoufoxConfig,
+  CamoufoxOS,
+  WayfernConfig,
+} from "@/types";
 
 const getCurrentOS = (): CamoufoxOS => {
   if (typeof navigator === "undefined") return "linux";
@@ -28,6 +34,10 @@ interface CamoufoxConfigDialogProps {
   onClose: () => void;
   profile: BrowserProfile | null;
   onSave: (profile: BrowserProfile, config: CamoufoxConfig) => Promise<void>;
+  onSaveWayfern?: (
+    profile: BrowserProfile,
+    config: CamoufoxConfig,
+  ) => Promise<void>;
   isRunning?: boolean;
 }
 
@@ -36,27 +46,39 @@ export function CamoufoxConfigDialog({
   onClose,
   profile,
   onSave,
+  onSaveWayfern,
   isRunning = false,
 }: CamoufoxConfigDialogProps) {
-  const [config, setConfig] = useState<CamoufoxConfig>(() => ({
+  // Use union type to support both Camoufox and Wayfern configs
+  const [config, setConfig] = useState<CamoufoxConfig | WayfernConfig>(() => ({
     geoip: true,
     os: getCurrentOS(),
   }));
   const [isSaving, setIsSaving] = useState(false);
 
+  const isAntiDetectBrowser =
+    profile?.browser === "camoufox" || profile?.browser === "wayfern";
+
   // Initialize config when profile changes
   useEffect(() => {
-    if (profile && profile.browser === "camoufox") {
+    if (profile && isAntiDetectBrowser) {
+      const profileConfig =
+        profile.browser === "wayfern"
+          ? profile.wayfern_config
+          : profile.camoufox_config;
       setConfig(
-        profile.camoufox_config || {
+        profileConfig || {
           geoip: true,
           os: getCurrentOS(),
         },
       );
     }
-  }, [profile]);
+  }, [profile, isAntiDetectBrowser]);
 
-  const updateConfig = (key: keyof CamoufoxConfig, value: unknown) => {
+  const updateConfig = (
+    key: keyof CamoufoxConfig | keyof WayfernConfig,
+    value: unknown,
+  ) => {
     setConfig((prev) => ({ ...prev, [key]: value }));
   };
 
@@ -79,10 +101,14 @@ export function CamoufoxConfigDialog({
 
     setIsSaving(true);
     try {
-      await onSave(profile, config);
+      if (profile.browser === "wayfern" && onSaveWayfern) {
+        await onSaveWayfern(profile, config as CamoufoxConfig);
+      } else {
+        await onSave(profile, config as CamoufoxConfig);
+      }
       onClose();
     } catch (error) {
-      console.error("Failed to save camoufox config:", error);
+      console.error("Failed to save config:", error);
       const { toast } = await import("sonner");
       toast.error("Failed to save configuration", {
         description:
@@ -95,9 +121,13 @@ export function CamoufoxConfigDialog({
 
   const handleClose = () => {
     // Reset config to original when closing without saving
-    if (profile && profile.browser === "camoufox") {
+    if (profile && isAntiDetectBrowser) {
+      const profileConfig =
+        profile.browser === "wayfern"
+          ? profile.wayfern_config
+          : profile.camoufox_config;
       setConfig(
-        profile.camoufox_config || {
+        profileConfig || {
           geoip: true,
           os: getCurrentOS(),
         },
@@ -106,11 +136,11 @@ export function CamoufoxConfigDialog({
     onClose();
   };
 
-  if (!profile || profile.browser !== "camoufox") {
+  if (!profile || !isAntiDetectBrowser) {
     return null;
   }
 
-  // No OS warning needed anymore since we removed OS selection
+  const browserName = profile.browser === "wayfern" ? "Wayfern" : "Camoufox";
 
   return (
     <Dialog open={isOpen} onOpenChange={handleClose}>
@@ -118,18 +148,28 @@ export function CamoufoxConfigDialog({
         <DialogHeader className="shrink-0">
           <DialogTitle>
             {isRunning ? "View" : "Configure"} Fingerprint Settings -{" "}
-            {profile.name}
+            {profile.name} ({browserName})
           </DialogTitle>
         </DialogHeader>
 
         <ScrollArea className="flex-1 h-[300px]">
           <div className="py-4">
-            <SharedCamoufoxConfigForm
-              config={config}
-              onConfigChange={updateConfig}
-              forceAdvanced={true}
-              readOnly={isRunning}
-            />
+            {profile.browser === "wayfern" ? (
+              <WayfernConfigForm
+                config={config as WayfernConfig}
+                onConfigChange={updateConfig}
+                forceAdvanced={true}
+                readOnly={isRunning}
+              />
+            ) : (
+              <SharedCamoufoxConfigForm
+                config={config as CamoufoxConfig}
+                onConfigChange={updateConfig}
+                forceAdvanced={true}
+                readOnly={isRunning}
+                browserType="camoufox"
+              />
+            )}
           </div>
         </ScrollArea>
 

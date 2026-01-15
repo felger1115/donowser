@@ -12,7 +12,7 @@ on:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     permissions:
       security-events: write
       packages: read
@@ -27,8 +27,6 @@ jobs:
             build-mode: none
           - language: javascript-typescript
             build-mode: none
-          # - language: rust
-          #   build-mode: none
     steps:
       - name: Checkout repository
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
@@ -44,48 +42,8 @@ jobs:
           node-version-file: .node-version
           cache: "pnpm"
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 #master
-        with:
-          toolchain: stable
-          targets: x86_64-unknown-linux-gnu
-
-      - name: Install system dependencies (Rust only)
-        if: matrix.language == 'rust'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xdg-utils
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 #v2.8.2
-        with:
-          workdir: ./src-tauri
-
-      - name: Install banderole
-        run: cargo install banderole
-
       - name: Install dependencies from lockfile
         run: pnpm install --frozen-lockfile
-        
-      - name: Install rust dependencies
-        if: matrix.language == 'rust'
-        working-directory: ./src-tauri
-        run: |
-          cargo build
-        
-      - name: Build nodecar sidecar
-        if: matrix.language == 'rust'
-        shell: bash
-        working-directory: ./nodecar
-        run: |
-          pnpm run build:linux-x64
-
-      - name: Copy nodecar binary to Tauri binaries
-        if: matrix.language == 'rust'
-        shell: bash
-        run: |
-          mkdir -p src-tauri/binaries
-          cp nodecar/nodecar-bin src-tauri/binaries/nodecar-x86_64-unknown-linux-gnu
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@b1e4dc3db58c9601794e22a9f6d28d45461b9dbf #v3.29.0

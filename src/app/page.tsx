@@ -5,6 +5,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrent } from "@tauri-apps/plugin-deep-link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CamoufoxConfigDialog } from "@/components/camoufox-config-dialog";
+import { CommercialTrialModal } from "@/components/commercial-trial-modal";
+import { CookieCopyDialog } from "@/components/cookie-copy-dialog";
 import { CreateProfileDialog } from "@/components/create-profile-dialog";
 import { DeleteConfirmationDialog } from "@/components/delete-confirmation-dialog";
 import { GroupAssignmentDialog } from "@/components/group-assignment-dialog";
@@ -12,6 +14,7 @@ import { GroupBadges } from "@/components/group-badges";
 import { GroupManagementDialog } from "@/components/group-management-dialog";
 import HomeHeader from "@/components/home-header";
 import { ImportProfileDialog } from "@/components/import-profile-dialog";
+import { IntegrationsDialog } from "@/components/integrations-dialog";
 import { PermissionDialog } from "@/components/permission-dialog";
 import { ProfilesDataTable } from "@/components/profile-data-table";
 import { ProfileSelectorDialog } from "@/components/profile-selector-dialog";
@@ -20,7 +23,9 @@ import { ProxyAssignmentDialog } from "@/components/proxy-assignment-dialog";
 import { ProxyManagementDialog } from "@/components/proxy-management-dialog";
 import { SettingsDialog } from "@/components/settings-dialog";
 import { SyncConfigDialog } from "@/components/sync-config-dialog";
+import { WayfernTermsDialog } from "@/components/wayfern-terms-dialog";
 import { useAppUpdateNotifications } from "@/hooks/use-app-update-notifications";
+import { useCommercialTrial } from "@/hooks/use-commercial-trial";
 import { useGroupEvents } from "@/hooks/use-group-events";
 import type { PermissionType } from "@/hooks/use-permissions";
 import { usePermissions } from "@/hooks/use-permissions";
@@ -28,8 +33,9 @@ import { useProfileEvents } from "@/hooks/use-profile-events";
 import { useProxyEvents } from "@/hooks/use-proxy-events";
 import { useUpdateNotifications } from "@/hooks/use-update-notifications";
 import { useVersionUpdater } from "@/hooks/use-version-updater";
+import { useWayfernTerms } from "@/hooks/use-wayfern-terms";
 import { showErrorToast, showSuccessToast, showToast } from "@/lib/toast-utils";
-import type { BrowserProfile, CamoufoxConfig } from "@/types";
+import type { BrowserProfile, CamoufoxConfig, WayfernConfig } from "@/types";
 
 type BrowserTypeString =
   | "firefox"
@@ -37,7 +43,8 @@ type BrowserTypeString =
   | "chromium"
   | "brave"
   | "zen"
-  | "camoufox";
+  | "camoufox"
+  | "wayfern";
 
 interface PendingUrl {
   id: string;
@@ -47,7 +54,6 @@ interface PendingUrl {
 export default function Home() {
   // Mount global version update listener/toasts
   useVersionUpdater();
-  const [isInitializing, setIsInitializing] = useState(true);
 
   // Use the new profile events hook for centralized profile management
   const {
@@ -69,8 +75,21 @@ export default function Home() {
     error: proxiesError,
   } = useProxyEvents();
 
+  // Wayfern terms and commercial trial hooks
+  const {
+    termsAccepted,
+    isLoading: termsLoading,
+    checkTerms,
+  } = useWayfernTerms();
+  const {
+    trialStatus,
+    hasAcknowledged: trialAcknowledged,
+    checkTrialStatus,
+  } = useCommercialTrial();
+
   const [createProfileDialogOpen, setCreateProfileDialogOpen] = useState(false);
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
+  const [integrationsDialogOpen, setIntegrationsDialogOpen] = useState(false);
   const [importProfileDialogOpen, setImportProfileDialogOpen] = useState(false);
   const [proxyManagementDialogOpen, setProxyManagementDialogOpen] =
     useState(false);
@@ -82,6 +101,10 @@ export default function Home() {
     useState(false);
   const [proxyAssignmentDialogOpen, setProxyAssignmentDialogOpen] =
     useState(false);
+  const [cookieCopyDialogOpen, setCookieCopyDialogOpen] = useState(false);
+  const [selectedProfilesForCookies, setSelectedProfilesForCookies] = useState<
+    string[]
+  >([]);
   const [selectedGroupId, setSelectedGroupId] = useState<string>("default");
   const [selectedProfilesForGroup, setSelectedProfilesForGroup] = useState<
     string[]
@@ -257,27 +280,6 @@ export default function Home() {
     }
   }, [hasCheckedStartupPrompt]);
 
-  // Warm up nodecar at startup and block UI until complete
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        await invoke("warm_up_nodecar");
-      } catch (err) {
-        if (!cancelled) {
-          // Don't set error here since useProfileEvents handles profile errors
-          console.error("Initialization failed:", err);
-        }
-      } finally {
-        if (!cancelled) setIsInitializing(false);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   // Handle profile errors from useProfileEvents hook
   useEffect(() => {
     if (profilesError) {
@@ -409,6 +411,26 @@ export default function Home() {
     [],
   );
 
+  const handleSaveWayfernConfig = useCallback(
+    async (profile: BrowserProfile, config: WayfernConfig) => {
+      try {
+        await invoke("update_wayfern_config", {
+          profileId: profile.id,
+          config,
+        });
+        // No need to manually reload - useProfileEvents will handle the update
+        setCamoufoxConfigDialogOpen(false);
+      } catch (err: unknown) {
+        console.error("Failed to update wayfern config:", err);
+        showErrorToast(
+          `Failed to update wayfern config: ${JSON.stringify(err)}`,
+        );
+        throw err;
+      }
+    },
+    [],
+  );
+
   const handleCreateProfile = useCallback(
     async (profileData: {
       name: string;
@@ -417,6 +439,7 @@ export default function Home() {
       releaseType: string;
       proxyId?: string;
       camoufoxConfig?: CamoufoxConfig;
+      wayfernConfig?: WayfernConfig;
       groupId?: string;
     }) => {
       try {
@@ -427,6 +450,7 @@ export default function Home() {
           releaseType: profileData.releaseType,
           proxyId: profileData.proxyId,
           camoufoxConfig: profileData.camoufoxConfig,
+          wayfernConfig: profileData.wayfernConfig,
           groupId:
             profileData.groupId ||
             (selectedGroupId !== "default" ? selectedGroupId : undefined),
@@ -584,6 +608,28 @@ export default function Home() {
     setSelectedProfiles([]);
   }, [selectedProfiles, handleAssignProfilesToProxy]);
 
+  const handleBulkCopyCookies = useCallback(() => {
+    if (selectedProfiles.length === 0) return;
+    const eligibleProfiles = profiles.filter(
+      (p) =>
+        selectedProfiles.includes(p.id) &&
+        (p.browser === "wayfern" || p.browser === "camoufox"),
+    );
+    if (eligibleProfiles.length === 0) {
+      showErrorToast(
+        "Cookie copy only works with Wayfern and Camoufox profiles",
+      );
+      return;
+    }
+    setSelectedProfilesForCookies(eligibleProfiles.map((p) => p.id));
+    setCookieCopyDialogOpen(true);
+  }, [selectedProfiles, profiles]);
+
+  const handleCopyCookiesToProfile = useCallback((profile: BrowserProfile) => {
+    setSelectedProfilesForCookies([profile.id]);
+    setCookieCopyDialogOpen(true);
+  }, []);
+
   const handleGroupAssignmentComplete = useCallback(async () => {
     // No need to manually reload - useProfileEvents will handle the update
     setGroupAssignmentDialogOpen(false);
@@ -706,6 +752,38 @@ export default function Home() {
     }
   }, [profiles]);
 
+  // Show warning for non-wayfern/camoufox profiles (support ending March 1, 2026)
+  useEffect(() => {
+    if (profiles.length === 0) return;
+
+    const unsupportedProfiles = profiles.filter(
+      (p) => p.browser !== "wayfern" && p.browser !== "camoufox",
+    );
+
+    if (unsupportedProfiles.length > 0) {
+      const unsupportedNames = unsupportedProfiles
+        .map((p) => p.name)
+        .join(", ");
+
+      showToast({
+        id: "browser-support-ending-warning",
+        type: "error",
+        title: "Browser support ending soon",
+        description: `Support for the following profiles will be removed on March 1, 2026: ${unsupportedNames}. Please migrate to Wayfern or Camoufox profiles.`,
+        duration: 15000,
+        action: {
+          label: "Learn more",
+          onClick: () => {
+            const event = new CustomEvent("url-open-request", {
+              detail: "https://github.com/zhom/donutbrowser/discussions",
+            });
+            window.dispatchEvent(event);
+          },
+        },
+      });
+    }
+  }, [profiles]);
+
   // Check permissions when they are initialized
   useEffect(() => {
     if (isInitialized) {
@@ -761,6 +839,7 @@ export default function Home() {
             onProxyManagementDialogOpen={setProxyManagementDialogOpen}
             onSettingsDialogOpen={setSettingsDialogOpen}
             onSyncConfigDialogOpen={setSyncConfigDialogOpen}
+            onIntegrationsDialogOpen={setIntegrationsDialogOpen}
             searchQuery={searchQuery}
             onSearchQueryChange={setSearchQuery}
           />
@@ -779,6 +858,7 @@ export default function Home() {
             onDeleteProfile={handleDeleteProfile}
             onRenameProfile={handleRenameProfile}
             onConfigureCamoufox={handleConfigureCamoufox}
+            onCopyCookiesToProfile={handleCopyCookiesToProfile}
             runningProfiles={runningProfiles}
             isUpdating={isUpdating}
             onDeleteSelectedProfiles={handleDeleteSelectedProfiles}
@@ -789,23 +869,12 @@ export default function Home() {
             onBulkDelete={handleBulkDelete}
             onBulkGroupAssignment={handleBulkGroupAssignment}
             onBulkProxyAssignment={handleBulkProxyAssignment}
+            onBulkCopyCookies={handleBulkCopyCookies}
             onOpenProfileSyncDialog={handleOpenProfileSyncDialog}
             onToggleProfileSync={handleToggleProfileSync}
           />
         </div>
       </main>
-
-      {isInitializing && (
-        <div className="fixed inset-0 z-1000 backdrop-blur-sm bg-background/30 flex items-center justify-center">
-          <div className="bg-background rounded-xl p-6 shadow-xl border border-border/10 w-[320px] text-center">
-            <div className="text-lg font-medium">Initializing</div>
-            <div className="mt-1 mb-2 text-sm text-gray-600 dark:text-gray-300">
-              Please don't close the app
-            </div>
-            <div className="mx-auto mb-4 w-8 h-8 rounded-full border-2 animate-spin border-muted/40 border-t-primary" />
-          </div>
-        </div>
-      )}
 
       <CreateProfileDialog
         isOpen={createProfileDialogOpen}
@@ -820,6 +889,17 @@ export default function Home() {
         isOpen={settingsDialogOpen}
         onClose={() => {
           setSettingsDialogOpen(false);
+        }}
+        onIntegrationsOpen={() => {
+          setSettingsDialogOpen(false);
+          setIntegrationsDialogOpen(true);
+        }}
+      />
+
+      <IntegrationsDialog
+        isOpen={integrationsDialogOpen}
+        onClose={() => {
+          setIntegrationsDialogOpen(false);
         }}
       />
 
@@ -868,6 +948,7 @@ export default function Home() {
         }}
         profile={currentProfileForCamoufoxConfig}
         onSave={handleSaveCamoufoxConfig}
+        onSaveWayfern={handleSaveWayfernConfig}
         isRunning={
           currentProfileForCamoufoxConfig
             ? runningProfiles.has(currentProfileForCamoufoxConfig.id)
@@ -904,6 +985,18 @@ export default function Home() {
         storedProxies={storedProxies}
       />
 
+      <CookieCopyDialog
+        isOpen={cookieCopyDialogOpen}
+        onClose={() => {
+          setCookieCopyDialogOpen(false);
+          setSelectedProfilesForCookies([]);
+        }}
+        selectedProfiles={selectedProfilesForCookies}
+        profiles={profiles}
+        runningProfiles={runningProfiles}
+        onCopyComplete={() => setSelectedProfilesForCookies([])}
+      />
+
       <DeleteConfirmationDialog
         isOpen={showBulkDeleteConfirmation}
         onClose={() => setShowBulkDeleteConfirmation(false)}
@@ -929,6 +1022,23 @@ export default function Home() {
         }}
         profile={currentProfileForSync}
         onSyncConfigOpen={() => setSyncConfigDialogOpen(true)}
+      />
+
+      {/* Wayfern Terms and Conditions Dialog - shown if terms not accepted */}
+      <WayfernTermsDialog
+        isOpen={!termsLoading && termsAccepted === false}
+        onAccepted={checkTerms}
+      />
+
+      {/* Commercial Trial Modal - shown once when trial expires */}
+      <CommercialTrialModal
+        isOpen={
+          !termsLoading &&
+          termsAccepted === true &&
+          trialStatus?.type === "Expired" &&
+          !trialAcknowledged
+        }
+        onClose={checkTrialStatus}
       />
     </div>
   );

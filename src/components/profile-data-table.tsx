@@ -19,6 +19,7 @@ import {
   LuCheck,
   LuChevronDown,
   LuChevronUp,
+  LuCookie,
   LuTrash2,
   LuUsers,
 } from "react-icons/lu";
@@ -67,6 +68,7 @@ import {
   getBrowserIcon,
   getCurrentOS,
 } from "@/lib/browser-utils";
+import { formatRelativeTime } from "@/lib/flag-utils";
 import { trimName } from "@/lib/name-utils";
 import { cn } from "@/lib/utils";
 import type {
@@ -157,6 +159,7 @@ type TableMeta = {
   // Overflow actions
   onAssignProfilesToGroup?: (profileIds: string[]) => void;
   onConfigureCamoufox?: (profile: BrowserProfile) => void;
+  onCopyCookiesToProfile?: (profile: BrowserProfile) => void;
 
   // Traffic snapshots (lightweight real-time data)
   trafficSnapshots: Record<string, TrafficSnapshot>;
@@ -672,6 +675,7 @@ interface ProfilesDataTableProps {
   onDeleteProfile: (profile: BrowserProfile) => void | Promise<void>;
   onRenameProfile: (profileId: string, newName: string) => Promise<void>;
   onConfigureCamoufox: (profile: BrowserProfile) => void;
+  onCopyCookiesToProfile?: (profile: BrowserProfile) => void;
   runningProfiles: Set<string>;
   isUpdating: (browser: string) => boolean;
   onDeleteSelectedProfiles: (profileIds: string[]) => Promise<void>;
@@ -682,6 +686,7 @@ interface ProfilesDataTableProps {
   onBulkDelete?: () => void;
   onBulkGroupAssignment?: () => void;
   onBulkProxyAssignment?: () => void;
+  onBulkCopyCookies?: () => void;
   onOpenProfileSyncDialog?: (profile: BrowserProfile) => void;
   onToggleProfileSync?: (profile: BrowserProfile) => void;
 }
@@ -693,6 +698,7 @@ export function ProfilesDataTable({
   onDeleteProfile,
   onRenameProfile,
   onConfigureCamoufox,
+  onCopyCookiesToProfile,
   runningProfiles,
   isUpdating,
   onAssignProfilesToGroup,
@@ -701,6 +707,7 @@ export function ProfilesDataTable({
   onBulkDelete,
   onBulkGroupAssignment,
   onBulkProxyAssignment,
+  onBulkCopyCookies,
   onOpenProfileSyncDialog,
   onToggleProfileSync,
 }: ProfilesDataTableProps) {
@@ -1115,8 +1122,10 @@ export function ProfilesDataTable({
     if (!profileToDelete) return;
 
     setIsDeleting(true);
+    // Minimum loading time for visual feedback
+    const minLoadingTime = new Promise((r) => setTimeout(r, 300));
     try {
-      await onDeleteProfile(profileToDelete);
+      await Promise.all([onDeleteProfile(profileToDelete), minLoadingTime]);
       setProfileToDelete(null);
     } catch (error) {
       console.error("Failed to delete profile:", error);
@@ -1302,6 +1311,7 @@ export function ProfilesDataTable({
       // Overflow actions
       onAssignProfilesToGroup,
       onConfigureCamoufox,
+      onCopyCookiesToProfile,
 
       // Traffic snapshots (lightweight real-time data)
       trafficSnapshots,
@@ -1350,6 +1360,7 @@ export function ProfilesDataTable({
       onLaunchProfile,
       onAssignProfilesToGroup,
       onConfigureCamoufox,
+      onCopyCookiesToProfile,
       syncStatuses,
       onOpenProfileSyncDialog,
       onToggleProfileSync,
@@ -1901,59 +1912,26 @@ export function ProfilesDataTable({
         id: "sync",
         header: "",
         size: 24,
-        cell: ({ row, table }) => {
-          const meta = table.options.meta as TableMeta;
+        cell: ({ row }) => {
           const profile = row.original;
 
-          if (!profile.sync_enabled) {
+          if (!profile.sync_enabled && profile.last_sync) {
             return (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <span className="flex justify-center items-center w-3 h-3">
-                    <span className="w-2 h-2 rounded-full bg-muted-foreground/30" />
+                    <span className="w-2 h-2 rounded-full bg-orange-500" />
                   </span>
                 </TooltipTrigger>
-                <TooltipContent>Sync disabled</TooltipContent>
+                <TooltipContent>
+                  Sync is disabled, last sync{" "}
+                  {formatRelativeTime(profile.last_sync)}
+                </TooltipContent>
               </Tooltip>
             );
           }
 
-          const syncStatus = meta.syncStatuses[profile.id];
-          const isSyncing = syncStatus === "syncing";
-          const isWaiting = syncStatus === "waiting";
-          const isSynced =
-            syncStatus === "synced" || (!syncStatus && profile.last_sync);
-          const isError = syncStatus === "error";
-
-          let dotClass = "bg-yellow-500";
-          let tooltipText = "Sync pending";
-
-          if (isSyncing) {
-            dotClass = "bg-yellow-500 animate-pulse";
-            tooltipText = "Syncing...";
-          } else if (isWaiting) {
-            dotClass = "bg-yellow-500";
-            tooltipText = "Waiting for profile to stop";
-          } else if (isError) {
-            dotClass = "bg-red-500";
-            tooltipText = "Sync error";
-          } else if (isSynced) {
-            dotClass = "bg-green-500";
-            tooltipText = profile.last_sync
-              ? `Last synced: ${new Date(profile.last_sync * 1000).toLocaleString()}`
-              : "Synced";
-          }
-
-          return (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span className="flex justify-center items-center w-3 h-3">
-                  <span className={`w-2 h-2 rounded-full ${dotClass}`} />
-                </span>
-              </TooltipTrigger>
-              <TooltipContent>{tooltipText}</TooltipContent>
-            </Tooltip>
-          );
+          return null;
         },
       },
       {
@@ -1999,7 +1977,8 @@ export function ProfilesDataTable({
                   >
                     Assign to Group
                   </DropdownMenuItem>
-                  {profile.browser === "camoufox" &&
+                  {(profile.browser === "camoufox" ||
+                    profile.browser === "wayfern") &&
                     meta.onConfigureCamoufox && (
                       <DropdownMenuItem
                         onClick={() => {
@@ -2009,25 +1988,17 @@ export function ProfilesDataTable({
                         Change Fingerprint
                       </DropdownMenuItem>
                     )}
-                  {meta.onOpenProfileSyncDialog && (
-                    <DropdownMenuItem
-                      onClick={() => {
-                        meta.onOpenProfileSyncDialog?.(profile);
-                      }}
-                    >
-                      Sync Settings
-                    </DropdownMenuItem>
-                  )}
-                  {meta.onToggleProfileSync && (
-                    <DropdownMenuItem
-                      onClick={() => {
-                        meta.onToggleProfileSync?.(profile);
-                      }}
-                      disabled={isDisabled}
-                    >
-                      {profile.sync_enabled ? "Disable Sync" : "Enable Sync"}
-                    </DropdownMenuItem>
-                  )}
+                  {(profile.browser === "camoufox" ||
+                    profile.browser === "wayfern") &&
+                    meta.onCopyCookiesToProfile && (
+                      <DropdownMenuItem
+                        onClick={() => {
+                          meta.onCopyCookiesToProfile?.(profile);
+                        }}
+                      >
+                        Copy Cookies to Profile
+                      </DropdownMenuItem>
+                    )}
                   <DropdownMenuItem
                     onClick={() => {
                       setProfileToDelete(profile);
@@ -2157,6 +2128,15 @@ export function ProfilesDataTable({
             size="icon"
           >
             <FiWifi />
+          </DataTableActionBarAction>
+        )}
+        {onBulkCopyCookies && (
+          <DataTableActionBarAction
+            tooltip="Copy Cookies"
+            onClick={onBulkCopyCookies}
+            size="icon"
+          >
+            <LuCookie />
           </DataTableActionBarAction>
         )}
         {onBulkDelete && (

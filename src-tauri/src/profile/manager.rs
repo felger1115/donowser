@@ -2,17 +2,19 @@ use crate::api_client::is_browser_version_nightly;
 use crate::browser::{create_browser, BrowserType, ProxySettings};
 use crate::camoufox_manager::CamoufoxConfig;
 use crate::downloaded_browsers_registry::DownloadedBrowsersRegistry;
+use crate::events;
 use crate::profile::types::BrowserProfile;
 use crate::proxy_manager::PROXY_MANAGER;
+use crate::wayfern_manager::WayfernConfig;
 use directories::BaseDirs;
 use std::fs::{self, create_dir_all};
 use std::path::{Path, PathBuf};
 use sysinfo::{Pid, System};
-use tauri::Emitter;
 
 pub struct ProfileManager {
   base_dirs: BaseDirs,
   camoufox_manager: &'static crate::camoufox_manager::CamoufoxManager,
+  wayfern_manager: &'static crate::wayfern_manager::WayfernManager,
 }
 
 impl ProfileManager {
@@ -20,6 +22,7 @@ impl ProfileManager {
     Self {
       base_dirs: BaseDirs::new().expect("Failed to get base directories"),
       camoufox_manager: crate::camoufox_manager::CamoufoxManager::instance(),
+      wayfern_manager: crate::wayfern_manager::WayfernManager::instance(),
     }
   }
 
@@ -59,6 +62,7 @@ impl ProfileManager {
     release_type: &str,
     proxy_id: Option<String>,
     camoufox_config: Option<CamoufoxConfig>,
+    wayfern_config: Option<WayfernConfig>,
     group_id: Option<String>,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error>> {
     log::info!("Attempting to create profile: {name}");
@@ -163,6 +167,7 @@ impl ProfileManager {
           last_launch: None,
           release_type: release_type.to_string(),
           camoufox_config: None,
+          wayfern_config: None,
           group_id: group_id.clone(),
           tags: Vec::new(),
           note: None,
@@ -198,6 +203,118 @@ impl ProfileManager {
       camoufox_config.clone()
     };
 
+    // For Wayfern profiles, generate fingerprint during creation
+    let final_wayfern_config = if browser == "wayfern" {
+      let mut config = wayfern_config.unwrap_or_else(|| {
+        log::info!("Creating default Wayfern config for profile: {name}");
+        crate::wayfern_manager::WayfernConfig::default()
+      });
+
+      // Always ensure executable_path is set to the user's binary location
+      if config.executable_path.is_none() {
+        let mut browser_dir = self.get_binaries_dir();
+        browser_dir.push(browser);
+        browser_dir.push(version);
+
+        #[cfg(target_os = "macos")]
+        let binary_path = browser_dir
+          .join("Chromium.app")
+          .join("Contents")
+          .join("MacOS")
+          .join("Chromium");
+
+        #[cfg(target_os = "windows")]
+        let binary_path = browser_dir.join("chrome.exe");
+
+        #[cfg(target_os = "linux")]
+        let binary_path = browser_dir.join("chrome");
+
+        config.executable_path = Some(binary_path.to_string_lossy().to_string());
+        log::info!("Set Wayfern executable path: {:?}", config.executable_path);
+      }
+
+      // Pass upstream proxy information to config for fingerprint generation
+      if let Some(proxy_id_ref) = &proxy_id {
+        if let Some(proxy_settings) = PROXY_MANAGER.get_proxy_settings_by_id(proxy_id_ref) {
+          let proxy_url = if let (Some(username), Some(password)) =
+            (&proxy_settings.username, &proxy_settings.password)
+          {
+            format!(
+              "{}://{}:{}@{}:{}",
+              proxy_settings.proxy_type.to_lowercase(),
+              username,
+              password,
+              proxy_settings.host,
+              proxy_settings.port
+            )
+          } else {
+            format!(
+              "{}://{}:{}",
+              proxy_settings.proxy_type.to_lowercase(),
+              proxy_settings.host,
+              proxy_settings.port
+            )
+          };
+          config.proxy = Some(proxy_url);
+          log::info!(
+            "Using upstream proxy for Wayfern fingerprint generation: {}://{}:{}",
+            proxy_settings.proxy_type.to_lowercase(),
+            proxy_settings.host,
+            proxy_settings.port
+          );
+        }
+      }
+
+      // Generate fingerprint if not already provided
+      if config.fingerprint.is_none() {
+        log::info!("Generating fingerprint for Wayfern profile: {name}");
+
+        // Create a temporary profile for fingerprint generation
+        let temp_profile = BrowserProfile {
+          id: uuid::Uuid::new_v4(),
+          name: name.to_string(),
+          browser: browser.to_string(),
+          version: version.to_string(),
+          proxy_id: proxy_id.clone(),
+          process_id: None,
+          last_launch: None,
+          release_type: release_type.to_string(),
+          camoufox_config: None,
+          wayfern_config: None,
+          group_id: group_id.clone(),
+          tags: Vec::new(),
+          note: None,
+          sync_enabled: false,
+          last_sync: None,
+        };
+
+        match self
+          .wayfern_manager
+          .generate_fingerprint_config(app_handle, &temp_profile, &config)
+          .await
+        {
+          Ok(generated_fingerprint) => {
+            config.fingerprint = Some(generated_fingerprint);
+            log::info!("Successfully generated fingerprint for Wayfern profile: {name}");
+          }
+          Err(e) => {
+            return Err(
+              format!("Failed to generate fingerprint for Wayfern profile '{name}': {e}").into(),
+            );
+          }
+        }
+      } else {
+        log::info!("Using provided fingerprint for Wayfern profile: {name}");
+      }
+
+      // Clear the proxy from config after fingerprint generation
+      config.proxy = None;
+
+      Some(config)
+    } else {
+      wayfern_config.clone()
+    };
+
     let profile = BrowserProfile {
       id: profile_id,
       name: name.to_string(),
@@ -208,6 +325,7 @@ impl ProfileManager {
       last_launch: None,
       release_type: release_type.to_string(),
       camoufox_config: final_camoufox_config,
+      wayfern_config: final_wayfern_config,
       group_id: group_id.clone(),
       tags: Vec::new(),
       note: None,
@@ -239,7 +357,7 @@ impl ProfileManager {
     }
 
     // Emit profile creation event
-    if let Err(e) = app_handle.emit("profiles-changed", ()) {
+    if let Err(e) = events::emit_empty("profiles-changed") {
       log::warn!("Warning: Failed to emit profiles-changed event: {e}");
     }
 
@@ -292,7 +410,7 @@ impl ProfileManager {
 
   pub fn rename_profile(
     &self,
-    app_handle: &tauri::AppHandle,
+    _app_handle: &tauri::AppHandle,
     profile_id: &str,
     new_name: &str,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error>> {
@@ -325,7 +443,7 @@ impl ProfileManager {
     });
 
     // Emit profile rename event
-    if let Err(e) = app_handle.emit("profiles-changed", ()) {
+    if let Err(e) = events::emit_empty("profiles-changed") {
       log::warn!("Warning: Failed to emit profiles-changed event: {e}");
     }
 
@@ -414,7 +532,7 @@ impl ProfileManager {
     }
 
     // Emit profile deletion event
-    if let Err(e) = app_handle.emit("profiles-changed", ()) {
+    if let Err(e) = events::emit_empty("profiles-changed") {
       log::warn!("Warning: Failed to emit profiles-changed event: {e}");
     }
 
@@ -423,7 +541,7 @@ impl ProfileManager {
 
   pub fn update_profile_version(
     &self,
-    app_handle: &tauri::AppHandle,
+    _app_handle: &tauri::AppHandle,
     profile_id: &str,
     version: &str,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error>> {
@@ -467,7 +585,7 @@ impl ProfileManager {
     self.save_profile(&profile)?;
 
     // Emit profile update event
-    if let Err(e) = app_handle.emit("profiles-changed", ()) {
+    if let Err(e) = events::emit_empty("profiles-changed") {
       log::warn!("Warning: Failed to emit profiles-changed event: {e}");
     }
 
@@ -523,7 +641,7 @@ impl ProfileManager {
     });
 
     // Emit profile group assignment event
-    if let Err(e) = app_handle.emit("profiles-changed", ()) {
+    if let Err(e) = events::emit_empty("profiles-changed") {
       log::warn!("Warning: Failed to emit profiles-changed event: {e}");
     }
 
@@ -532,7 +650,7 @@ impl ProfileManager {
 
   pub fn update_profile_tags(
     &self,
-    app_handle: &tauri::AppHandle,
+    _app_handle: &tauri::AppHandle,
     profile_id: &str,
     tags: Vec<String>,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error>> {
@@ -563,7 +681,7 @@ impl ProfileManager {
     });
 
     // Emit profile tags update event
-    if let Err(e) = app_handle.emit("profiles-changed", ()) {
+    if let Err(e) = events::emit_empty("profiles-changed") {
       log::warn!("Warning: Failed to emit profiles-changed event: {e}");
     }
 
@@ -572,7 +690,7 @@ impl ProfileManager {
 
   pub fn update_profile_note(
     &self,
-    app_handle: &tauri::AppHandle,
+    _app_handle: &tauri::AppHandle,
     profile_id: &str,
     note: Option<String>,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error>> {
@@ -592,7 +710,7 @@ impl ProfileManager {
     self.save_profile(&profile)?;
 
     // Emit profile note update event
-    if let Err(e) = app_handle.emit("profiles-changed", ()) {
+    if let Err(e) = events::emit_empty("profiles-changed") {
       log::warn!("Warning: Failed to emit profiles-changed event: {e}");
     }
 
@@ -655,7 +773,7 @@ impl ProfileManager {
     }
 
     // Emit profile deletion event
-    if let Err(e) = app_handle.emit("profiles-changed", ()) {
+    if let Err(e) = events::emit_empty("profiles-changed") {
       log::warn!("Warning: Failed to emit profiles-changed event: {e}");
     }
 
@@ -715,7 +833,67 @@ impl ProfileManager {
     );
 
     // Emit profile config update event
-    if let Err(e) = app_handle.emit("profiles-changed", ()) {
+    if let Err(e) = events::emit_empty("profiles-changed") {
+      log::warn!("Warning: Failed to emit profiles-changed event: {e}");
+    }
+
+    Ok(())
+  }
+
+  pub async fn update_wayfern_config(
+    &self,
+    app_handle: tauri::AppHandle,
+    profile_id: &str,
+    config: WayfernConfig,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Find the profile by ID
+    let profile_uuid = uuid::Uuid::parse_str(profile_id).map_err(
+      |_| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Invalid profile ID: {profile_id}").into()
+      },
+    )?;
+    let profiles =
+      self
+        .list_profiles()
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+          format!("Failed to list profiles: {e}").into()
+        })?;
+    let mut profile = profiles
+      .into_iter()
+      .find(|p| p.id == profile_uuid)
+      .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Profile with ID '{profile_id}' not found").into()
+      })?;
+
+    // Check if the browser is currently running using the comprehensive status check
+    let is_running = self
+      .check_browser_status(app_handle.clone(), &profile)
+      .await?;
+
+    if is_running {
+      return Err(
+        "Cannot update Wayfern configuration while browser is running. Please stop the browser first.".into(),
+      );
+    }
+
+    // Update the Wayfern configuration
+    profile.wayfern_config = Some(config);
+
+    // Save the updated profile
+    self
+      .save_profile(&profile)
+      .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Failed to save profile: {e}").into()
+      })?;
+
+    log::info!(
+      "Wayfern configuration updated for profile '{}' (ID: {}).",
+      profile.name,
+      profile_id
+    );
+
+    // Emit profile config update event
+    if let Err(e) = events::emit_empty("profiles-changed") {
       log::warn!("Warning: Failed to emit profiles-changed event: {e}");
     }
 
@@ -803,12 +981,12 @@ impl ProfileManager {
     }
 
     // Emit profile update event so frontend UIs can refresh immediately (e.g. proxy manager)
-    if let Err(e) = app_handle.emit("profile-updated", &profile) {
+    if let Err(e) = events::emit("profile-updated", &profile) {
       log::warn!("Warning: Failed to emit profile update event: {e}");
     }
 
     // Emit general profiles changed event for profile list updates
-    if let Err(e) = app_handle.emit("profiles-changed", ()) {
+    if let Err(e) = events::emit_empty("profiles-changed") {
       log::warn!("Warning: Failed to emit profiles-changed event: {e}");
     }
 
@@ -820,11 +998,14 @@ impl ProfileManager {
     app_handle: tauri::AppHandle,
     profile: &BrowserProfile,
   ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    // Handle Camoufox profiles using nodecar-based status checking
+    // Handle Camoufox profiles using CamoufoxManager-based status checking
     if profile.browser == "camoufox" {
-      return self
-        .check_camoufox_status_via_nodecar(&app_handle, profile)
-        .await;
+      return self.check_camoufox_status(&app_handle, profile).await;
+    }
+
+    // Handle Wayfern profiles using WayfernManager-based status checking
+    if profile.browser == "wayfern" {
+      return self.check_wayfern_status(&app_handle, profile).await;
     }
 
     // For non-camoufox browsers, use the existing PID-based logic
@@ -888,7 +1069,7 @@ impl ProfileManager {
             "zen" => exe_name.contains("zen"),
             "chromium" => exe_name.contains("chromium"),
             "brave" => exe_name.contains("brave"),
-            // Camoufox is handled via nodecar, not PID-based checking
+            // Camoufox is handled via CamoufoxManager, not PID-based checking
             _ => false,
           };
 
@@ -973,7 +1154,7 @@ impl ProfileManager {
       }
 
       // Emit profile update event to frontend
-      if let Err(e) = app_handle.emit("profile-updated", &merged) {
+      if let Err(e) = events::emit("profile-updated", &merged) {
         log::warn!("Warning: Failed to emit profile update event: {e}");
       }
     }
@@ -981,10 +1162,10 @@ impl ProfileManager {
     Ok(is_running)
   }
 
-  // Check Camoufox status using nodecar-based approach
-  async fn check_camoufox_status_via_nodecar(
+  // Check Camoufox status using CamoufoxManager
+  async fn check_camoufox_status(
     &self,
-    app_handle: &tauri::AppHandle,
+    _app_handle: &tauri::AppHandle,
     profile: &BrowserProfile,
   ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let launcher = self.camoufox_manager;
@@ -1018,7 +1199,7 @@ impl ProfileManager {
             }
 
             // Emit profile update event to frontend
-            if let Err(e) = app_handle.emit("profile-updated", &latest) {
+            if let Err(e) = events::emit("profile-updated", &latest) {
               log::warn!("Warning: Failed to emit profile update event: {e}");
             }
 
@@ -1053,7 +1234,7 @@ impl ProfileManager {
               log::warn!("Warning: Failed to clear Camoufox profile process info: {e}");
             }
 
-            if let Err(e) = app_handle.emit("profile-updated", &latest) {
+            if let Err(e) = events::emit("profile-updated", &latest) {
               log::warn!("Warning: Failed to emit profile update event: {e}");
             }
           }
@@ -1062,7 +1243,7 @@ impl ProfileManager {
       }
       Err(e) => {
         // Error checking status, assume not running and clear process ID
-        log::warn!("Warning: Failed to check Camoufox status via nodecar: {e}");
+        log::warn!("Warning: Failed to check Camoufox status: {e}");
         let profiles_dir = self.get_profiles_dir();
         let profile_uuid_dir = profiles_dir.join(profile.id.to_string());
         let metadata_file = profile_uuid_dir.join("metadata.json");
@@ -1086,8 +1267,90 @@ impl ProfileManager {
             }
 
             // Emit profile update event to frontend
-            if let Err(e3) = app_handle.emit("profile-updated", &latest) {
+            if let Err(e3) = events::emit("profile-updated", &latest) {
               log::warn!("Warning: Failed to emit profile update event: {e3}");
+            }
+          }
+        }
+        Ok(false)
+      }
+    }
+  }
+
+  // Check Wayfern status using WayfernManager
+  async fn check_wayfern_status(
+    &self,
+    _app_handle: &tauri::AppHandle,
+    profile: &BrowserProfile,
+  ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let manager = self.wayfern_manager;
+    let profiles_dir = self.get_profiles_dir();
+    let profile_data_path = profile.get_profile_data_path(&profiles_dir);
+    let profile_path_str = profile_data_path.to_string_lossy();
+
+    // Check if there's a running Wayfern instance for this profile
+    match manager.find_wayfern_by_profile(&profile_path_str).await {
+      Some(wayfern_process) => {
+        // Found a running instance, update profile with process info if changed
+        let profiles_dir = self.get_profiles_dir();
+        let profile_uuid_dir = profiles_dir.join(profile.id.to_string());
+        let metadata_file = profile_uuid_dir.join("metadata.json");
+        let metadata_exists = metadata_file.exists();
+
+        if metadata_exists {
+          // Load latest to avoid overwriting other fields
+          let mut latest: BrowserProfile = match std::fs::read_to_string(&metadata_file)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+          {
+            Some(p) => p,
+            None => profile.clone(),
+          };
+
+          if latest.process_id != wayfern_process.processId {
+            latest.process_id = wayfern_process.processId;
+            if let Err(e) = self.save_profile(&latest) {
+              log::warn!("Warning: Failed to update Wayfern profile with process info: {e}");
+            }
+
+            // Emit profile update event to frontend
+            if let Err(e) = events::emit("profile-updated", &latest) {
+              log::warn!("Warning: Failed to emit profile update event: {e}");
+            }
+
+            log::info!(
+              "Wayfern process has started for profile '{}' with PID: {:?}",
+              profile.name,
+              wayfern_process.processId
+            );
+          }
+        }
+        Ok(true)
+      }
+      None => {
+        // No running instance found, clear process ID if set
+        let profiles_dir = self.get_profiles_dir();
+        let profile_uuid_dir = profiles_dir.join(profile.id.to_string());
+        let metadata_file = profile_uuid_dir.join("metadata.json");
+        let metadata_exists = metadata_file.exists();
+
+        if metadata_exists {
+          let mut latest: BrowserProfile = match std::fs::read_to_string(&metadata_file)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+          {
+            Some(p) => p,
+            None => profile.clone(),
+          };
+
+          if latest.process_id.is_some() {
+            latest.process_id = None;
+            if let Err(e) = self.save_profile(&latest) {
+              log::warn!("Warning: Failed to clear Wayfern profile process info: {e}");
+            }
+
+            if let Err(e) = events::emit("profile-updated", &latest) {
+              log::warn!("Warning: Failed to emit profile update event: {e}");
             }
           }
         }
@@ -1455,6 +1718,7 @@ pub async fn create_browser_profile_with_group(
   release_type: String,
   proxy_id: Option<String>,
   camoufox_config: Option<CamoufoxConfig>,
+  wayfern_config: Option<WayfernConfig>,
   group_id: Option<String>,
 ) -> Result<BrowserProfile, String> {
   let profile_manager = ProfileManager::instance();
@@ -1467,6 +1731,7 @@ pub async fn create_browser_profile_with_group(
       &release_type,
       proxy_id,
       camoufox_config,
+      wayfern_config,
       group_id,
     )
     .await
@@ -1552,6 +1817,7 @@ pub async fn create_browser_profile_new(
   release_type: String,
   proxy_id: Option<String>,
   camoufox_config: Option<CamoufoxConfig>,
+  wayfern_config: Option<WayfernConfig>,
   group_id: Option<String>,
 ) -> Result<BrowserProfile, String> {
   let browser_type =
@@ -1564,6 +1830,7 @@ pub async fn create_browser_profile_new(
     release_type,
     proxy_id,
     camoufox_config,
+    wayfern_config,
     group_id,
   )
   .await
@@ -1580,6 +1847,19 @@ pub async fn update_camoufox_config(
     .update_camoufox_config(app_handle, &profile_id, config)
     .await
     .map_err(|e| format!("Failed to update Camoufox config: {e}"))
+}
+
+#[tauri::command]
+pub async fn update_wayfern_config(
+  app_handle: tauri::AppHandle,
+  profile_id: String,
+  config: WayfernConfig,
+) -> Result<(), String> {
+  let profile_manager = ProfileManager::instance();
+  profile_manager
+    .update_wayfern_config(app_handle, &profile_id, config)
+    .await
+    .map_err(|e| format!("Failed to update Wayfern config: {e}"))
 }
 
 // Global singleton instance

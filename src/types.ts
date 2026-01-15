@@ -21,6 +21,7 @@ export interface BrowserProfile {
   last_launch?: number;
   release_type: string; // "stable" or "nightly"
   camoufox_config?: CamoufoxConfig; // Camoufox configuration
+  wayfern_config?: WayfernConfig; // Wayfern configuration
   group_id?: string; // Reference to profile group
   tags?: string[];
   note?: string; // User note
@@ -289,6 +290,142 @@ export interface CamoufoxLaunchResult {
   url?: string;
 }
 
+export type WayfernOS = "windows" | "macos" | "linux" | "android" | "ios";
+
+export interface WayfernConfig {
+  proxy?: string;
+  screen_max_width?: number;
+  screen_max_height?: number;
+  screen_min_width?: number;
+  screen_min_height?: number;
+  geoip?: string | boolean; // For compatibility with shared config form
+  block_images?: boolean; // For compatibility with shared config form
+  block_webrtc?: boolean;
+  block_webgl?: boolean;
+  executable_path?: string;
+  fingerprint?: string; // JSON string of the complete fingerprint config
+  randomize_fingerprint_on_launch?: boolean; // Generate new fingerprint on every launch
+  os?: WayfernOS; // Operating system for fingerprint generation
+}
+
+// Wayfern fingerprint config - matches the C++ FingerprintData structure
+export interface WayfernFingerprintConfig {
+  // User agent and platform
+  userAgent?: string;
+  platform?: string;
+  platformVersion?: string;
+  brand?: string;
+  brandVersion?: string;
+
+  // Hardware
+  hardwareConcurrency?: number;
+  maxTouchPoints?: number;
+  deviceMemory?: number;
+
+  // Screen
+  screenWidth?: number;
+  screenHeight?: number;
+  screenAvailWidth?: number;
+  screenAvailHeight?: number;
+  screenColorDepth?: number;
+  screenPixelDepth?: number;
+  devicePixelRatio?: number;
+
+  // Window
+  windowOuterWidth?: number;
+  windowOuterHeight?: number;
+  windowInnerWidth?: number;
+  windowInnerHeight?: number;
+  screenX?: number;
+  screenY?: number;
+
+  // Language
+  language?: string;
+  languages?: string[];
+
+  // Browser features
+  doNotTrack?: string;
+  cookieEnabled?: boolean;
+  webdriver?: boolean;
+  pdfViewerEnabled?: boolean;
+
+  // WebGL
+  webglVendor?: string;
+  webglRenderer?: string;
+  webglVersion?: string;
+  webglShadingLanguageVersion?: string;
+  webglParameters?: string; // JSON string
+  webgl2Parameters?: string; // JSON string
+  webglShaderPrecisionFormats?: string; // JSON string
+  webgl2ShaderPrecisionFormats?: string; // JSON string
+
+  // Timezone and geolocation
+  timezone?: string;
+  timezoneOffset?: number;
+  latitude?: number;
+  longitude?: number;
+  accuracy?: number;
+
+  // Media queries / preferences
+  prefersReducedMotion?: boolean;
+  prefersDarkMode?: boolean;
+  prefersContrast?: string;
+  prefersReducedData?: boolean;
+
+  // Color/HDR
+  colorGamutSrgb?: boolean;
+  colorGamutP3?: boolean;
+  colorGamutRec2020?: boolean;
+  hdrSupport?: boolean;
+
+  // Audio
+  audioSampleRate?: number;
+  audioMaxChannelCount?: number;
+
+  // Storage
+  localStorage?: boolean;
+  sessionStorage?: boolean;
+  indexedDb?: boolean;
+
+  // Canvas
+  canvasNoiseSeed?: string;
+
+  // Fonts, plugins, mime types (JSON strings)
+  fonts?: string; // JSON array string
+  plugins?: string; // JSON array string
+  mimeTypes?: string; // JSON array string
+
+  // Battery (optional)
+  batteryCharging?: boolean;
+  batteryChargingTime?: number;
+  batteryDischargingTime?: number;
+  batteryLevel?: number;
+
+  // Voices
+  voices?: string; // JSON array string
+
+  // Vendor info
+  vendor?: string;
+  vendorSub?: string;
+  productSub?: string;
+
+  // Network (optional)
+  connectionEffectiveType?: string;
+  connectionDownlink?: number;
+  connectionRtt?: number;
+
+  // Performance
+  performanceMemory?: number;
+}
+
+export interface WayfernLaunchResult {
+  id: string;
+  processId?: number;
+  profilePath?: string;
+  url?: string;
+  cdp_port?: number;
+}
+
 // Traffic stats types
 export interface BandwidthDataPoint {
   timestamp: number;
@@ -343,4 +480,49 @@ export interface FilteredTrafficStats {
   period_requests: number;
   domains: Record<string, DomainAccess>;
   unique_ips: string[];
+}
+
+// Cookie copy types
+export interface UnifiedCookie {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  expires: number;
+  is_secure: boolean;
+  is_http_only: boolean;
+  same_site: number;
+  creation_time: number;
+  last_accessed: number;
+}
+
+export interface DomainCookies {
+  domain: string;
+  cookies: UnifiedCookie[];
+  cookie_count: number;
+}
+
+export interface CookieReadResult {
+  profile_id: string;
+  browser_type: string;
+  domains: DomainCookies[];
+  total_count: number;
+}
+
+export interface SelectedCookie {
+  domain: string;
+  name: string;
+}
+
+export interface CookieCopyRequest {
+  source_profile_id: string;
+  target_profile_ids: string[];
+  selected_cookies: SelectedCookie[];
+}
+
+export interface CookieCopyResult {
+  target_profile_id: string;
+  cookies_copied: number;
+  cookies_replaced: number;
+  errors: string[];
 }
