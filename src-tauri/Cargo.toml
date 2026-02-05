@@ -30,6 +30,7 @@ path = "src/bin/donut_daemon.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+resvg = "0.46"
 
 [dependencies]
 serde_json = "1"
@@ -46,22 +47,23 @@ log = "0.4"
 env_logger = "0.11"
 
 directories = "6"
-reqwest = { version = "0.13", features = ["json", "stream", "socks"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "stream", "socks", "charset", "http2", "system-proxy"] }
 tokio = { version = "1", features = ["full", "sync"] }
-sysinfo = "0.37"
-lazy_static = "1.4"
+tokio-util = "0.7"
+sysinfo = "0.38"
+lazy_static = "1.5"
 base64 = "0.22"
 libc = "0.2"
 async-trait = "0.1"
 futures-util = "0.3"
-zip = "7"
+zip = { version = "7", default-features = false, features = ["deflate-flate2"] }
 tar = "0"
 bzip2 = "0"
 flate2 = "1"
 lzma-rs = "0"
 msi-extract = "0"
 
-uuid = { version = "1.19", features = ["v4", "serde"] }
+uuid = { version = "1.20", features = ["v4", "serde"] }
 url = "2.5"
 blake3 = "1"
 globset = "0.4"
@@ -94,7 +96,10 @@ thiserror = "2.0"
 regex-lite = "0.1"
 tempfile = "3"
 maxminddb = "0.27"
-quick-xml = { version = "0.38", features = ["serialize"] }
+quick-xml = { version = "0.39", features = ["serialize"] }
+
+# VPN support
+boringtun = "0.7"
 
 # Daemon dependencies (tray icon)
 tray-icon = "0.21"
@@ -104,17 +109,18 @@ single-instance = "0.3"
 image = "0.25"
 dirs = "6"
 crossbeam-channel = "0.5"
+sys-locale = "0.3"
 
 [target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\"))".dependencies]
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
-objc2 = "0.6.1"
-objc2-app-kit = { version = "0.3.1", features = ["NSWindow", "NSApplication", "NSRunningApplication"] }
+objc2 = "0.6.3"
+objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSApplication", "NSRunningApplication"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55"
@@ -150,6 +156,10 @@ path = "tests/donut_proxy_integration.rs"
 [[test]]
 name = "sync_e2e"
 path = "tests/sync_e2e.rs"
+
+[[test]]
+name = "vpn_integration"
+path = "tests/vpn_integration.rs"
 
 [profile.dev]
 codegen-units = 256

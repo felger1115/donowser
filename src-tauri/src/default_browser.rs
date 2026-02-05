@@ -104,6 +104,7 @@ mod macos {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::needless_borrows_for_generic_args)]
 mod windows {
   use std::path::Path;
   use winreg::enums::*;
@@ -305,7 +306,7 @@ mod windows {
     match hkcu.create_subkey(&user_choice_path) {
       Ok((user_choice, _)) => {
         // Attempt to set the ProgId
-        if let Err(_) = user_choice.set_value("ProgId", &PROG_ID) {
+        if user_choice.set_value("ProgId", &PROG_ID).is_err() {
           // If we can't set UserChoice, that's expected on newer Windows versions
           // The registration is still valuable for the "Open with" menu
         }
@@ -345,37 +346,29 @@ mod windows {
     unsafe {
       use std::ffi::c_void;
 
-      // Declare the Windows API functions
-      type UINT = u32;
-      type DWORD = u32;
-      type LPARAM = isize;
-      type WPARAM = usize;
-
       const HWND_BROADCAST: *mut c_void = 0xffff as *mut c_void;
-      const WM_SETTINGCHANGE: UINT = 0x001A;
-      const SMTO_ABORTIFHUNG: UINT = 0x0002;
+      const WM_SETTINGCHANGE: u32 = 0x001A;
+      const SMTO_ABORTIFHUNG: u32 = 0x0002;
 
-      // Link to user32.dll functions
       extern "system" {
         fn SendMessageTimeoutA(
           hWnd: *mut c_void,
-          Msg: UINT,
-          wParam: WPARAM,
-          lParam: LPARAM,
-          fuFlags: UINT,
-          uTimeout: UINT,
-          lpdwResult: *mut DWORD,
+          Msg: u32,
+          wParam: usize,
+          lParam: isize,
+          fuFlags: u32,
+          uTimeout: u32,
+          lpdwResult: *mut u32,
         ) -> isize;
       }
 
-      let mut result: DWORD = 0;
+      let mut result: u32 = 0;
 
-      // Notify about file associations change
       SendMessageTimeoutA(
         HWND_BROADCAST,
         WM_SETTINGCHANGE,
         0,
-        "Software\\Classes\0".as_ptr() as LPARAM,
+        c"Software\\Classes".as_ptr() as isize,
         SMTO_ABORTIFHUNG,
         1000,
         &mut result,

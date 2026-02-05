@@ -47,11 +47,11 @@
 
 The app can be downloaded from the [releases page](https://github.com/zhom/donutbrowser/releases/latest).
 
-## Supported Platforms
+<!-- ## Supported Platforms
 
-- ✅ **macOS** (Intel & Apple Silicon)
-- ✅ **Linux** (x64 & arm64)
-- 🔄 **Windows** (Planned)
+- ✅ **macOS** (Apple Silicon)
+- ✅ **Linux** (x64)
+- ✅ **Windows** (x64) -->
 
 ## Development
 
@@ -62,6 +62,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Issues
 
 If you face any problems while using the application, please [open an issue](https://github.com/zhom/donutbrowser/issues).
+
+## Self-Hosting Sync
+
+Donut Browser supports syncing profiles, proxies, and groups across devices via a self-hosted sync server. See the [Self-Hosting Guide](docs/self-hosting-donut-sync.md) for Docker-based setup instructions.
 
 ## Community
 
