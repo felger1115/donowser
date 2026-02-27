@@ -362,15 +362,6 @@ impl AutoUpdater {
     Ok(updated_profiles)
   }
 
-  /// Check if browser is disabled due to ongoing update
-  pub fn is_browser_disabled(
-    &self,
-    browser: &str,
-  ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let state = self.load_auto_update_state()?;
-    Ok(state.disabled_browsers.contains(browser))
-  }
-
   /// Dismiss update notification
   pub fn dismiss_update_notification(
     &self,
@@ -511,6 +502,7 @@ mod tests {
       version: version.to_string(),
       process_id: None,
       proxy_id: None,
+      vpn_id: None,
       last_launch: None,
       release_type: "stable".to_string(),
       camoufox_config: None,
@@ -518,8 +510,11 @@ mod tests {
       group_id: None,
       tags: Vec::new(),
       note: None,
-      sync_enabled: false,
+      sync_mode: crate::profile::types::SyncMode::Disabled,
+      encryption_salt: None,
       last_sync: None,
+      host_os: None,
+      ephemeral: false,
     }
   }
 

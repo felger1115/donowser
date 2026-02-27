@@ -17,10 +17,30 @@ use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tokio::runtime::Runtime;
 use tray_icon::TrayIcon;
+#[cfg(not(target_os = "macos"))]
+use tray_icon::{MouseButton, TrayIconEvent};
 
 use donutbrowser_lib::daemon::{autostart, services, tray};
 
 static SHOULD_QUIT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+fn win_process_exists(pid: u32) -> bool {
+  const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+  extern "system" {
+    fn OpenProcess(dwDesiredAccess: u32, bInheritHandles: i32, dwProcessId: u32) -> *mut ();
+    fn CloseHandle(hObject: *mut ()) -> i32;
+  }
+
+  let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+  if handle.is_null() {
+    false
+  } else {
+    unsafe { CloseHandle(handle) };
+    true
+  }
+}
 
 enum ServiceStatus {
   Ready {
@@ -162,10 +182,7 @@ fn run_daemon() {
   }
 
   // Prepare tray menu and icon (but don't create the tray icon yet)
-  // Show "Starting..." state initially
   let tray_menu = tray::TrayMenu::new();
-  tray_menu.update_api_status(None);
-  tray_menu.update_mcp_status(false);
 
   let icon = tray::load_icon();
   let menu_channel = MenuEvent::receiver();
@@ -175,6 +192,41 @@ fn run_daemon() {
 
   // Store tray icon in Option - created after event loop starts
   let mut tray_icon: Option<TrayIcon> = None;
+
+  // Install signal handlers so SIGTERM/SIGINT trigger graceful shutdown
+  #[cfg(unix)]
+  unsafe {
+    extern "C" fn signal_handler(_sig: libc::c_int) {
+      SHOULD_QUIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    libc::signal(
+      libc::SIGTERM,
+      signal_handler as *const () as libc::sighandler_t,
+    );
+    libc::signal(
+      libc::SIGINT,
+      signal_handler as *const () as libc::sighandler_t,
+    );
+  }
+
+  #[cfg(windows)]
+  {
+    extern "system" {
+      fn SetConsoleCtrlHandler(
+        handler: Option<unsafe extern "system" fn(u32) -> i32>,
+        add: i32,
+      ) -> i32;
+    }
+
+    unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
+      SHOULD_QUIT.store(true, std::sync::atomic::Ordering::SeqCst);
+      1 // TRUE
+    }
+
+    unsafe {
+      SetConsoleCtrlHandler(Some(ctrl_handler), 1);
+    }
+  }
 
   // Run the event loop
   event_loop.run(move |event, _, control_flow| {
@@ -208,8 +260,6 @@ fn run_daemon() {
               mcp_running,
             } => {
               log::info!("[daemon] Services started successfully");
-              tray_menu.update_api_status(api_port);
-              tray_menu.update_mcp_status(mcp_running);
 
               // Update state file
               let mut state = read_state();
@@ -221,32 +271,51 @@ fn run_daemon() {
             }
             ServiceStatus::Failed(e) => {
               log::error!("Failed to start services: {}", e);
-              // Keep tray icon running, show error state
-              tray_menu.update_api_status(None);
-              tray_menu.update_mcp_status(false);
             }
           }
         }
 
         // Process menu events
         while let Ok(event) = menu_channel.try_recv() {
-          if event.id == tray_menu.open_item.id() || event.id == tray_menu.preferences_item.id() {
-            tray::open_gui();
-          } else if event.id == tray_menu.quit_item.id() {
+          if event.id == tray_menu.quit_item.id() {
             log::info!("[daemon] Quit requested");
             SHOULD_QUIT.store(true, Ordering::SeqCst);
           }
         }
 
+        // Handle tray icon click (left-click opens the app)
+        // On macOS, left-click already shows the menu, so don't also launch the GUI.
+        #[cfg(not(target_os = "macos"))]
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+          if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            ..
+          } = event
+          {
+            tray::open_gui();
+          }
+        }
+
         // Use swap to only run cleanup once
         if SHOULD_QUIT.swap(false, Ordering::SeqCst) {
-          // Cleanup
+          // Remove tray icon from status bar immediately so the UI feels responsive
+          tray_icon = None;
+
+          tray::quit_gui();
+
           let mut state = read_state();
           state.daemon_pid = None;
           let _ = write_state(&state);
           log::info!("[daemon] Exiting");
-          *control_flow = ControlFlow::Exit;
+
+          // Use process::exit for immediate termination instead of ControlFlow::Exit.
+          // ControlFlow::Exit can delay because tao's macOS event loop defers exit,
+          // and dropping the tokio runtime blocks until all spawned tasks finish.
+          process::exit(0);
         }
+      }
+      Event::Reopen { .. } => {
+        tray::open_gui();
       }
       _ => {}
     }
@@ -263,20 +332,37 @@ fn stop_daemon() {
   let state = read_state();
 
   if let Some(pid) = state.daemon_pid {
+    // On Windows, taskkill /F kills instantly with no handler, so kill GUI first
+    #[cfg(windows)]
+    {
+      use std::os::windows::process::CommandExt;
+      use std::process::Command;
+      const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+      let state_path = get_state_path();
+      if let Ok(content) = fs::read_to_string(&state_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+          if let Some(gui_pid) = val.get("gui_pid").and_then(|v| v.as_u64()) {
+            let _ = Command::new("taskkill")
+              .args(["/PID", &gui_pid.to_string(), "/F"])
+              .creation_flags(CREATE_NO_WINDOW)
+              .output();
+          }
+        }
+      }
+
+      let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+      eprintln!("Sent stop signal to daemon (PID {})", pid);
+    }
+
     #[cfg(unix)]
     {
       unsafe {
         libc::kill(pid as i32, libc::SIGTERM);
       }
-      eprintln!("Sent stop signal to daemon (PID {})", pid);
-    }
-
-    #[cfg(windows)]
-    {
-      use std::process::Command;
-      let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .output();
       eprintln!("Sent stop signal to daemon (PID {})", pid);
     }
   } else {
@@ -292,15 +378,7 @@ fn show_status() {
     let is_running = unsafe { libc::kill(pid as i32, 0) == 0 };
 
     #[cfg(windows)]
-    let is_running = {
-      use std::process::Command;
-      let output = Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {}", pid)])
-        .output();
-      output
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-        .unwrap_or(false)
-    };
+    let is_running = win_process_exists(pid);
 
     #[cfg(not(any(unix, windows)))]
     let is_running = false;
@@ -354,10 +432,6 @@ fn main() {
 
   match args[1].as_str() {
     "start" => {
-      // "start" is now an alias for "run"
-      // On macOS, the daemon should be started via launchctl (see daemon_spawn.rs)
-      // This command is kept for backward compatibility
-      eprintln!("Starting daemon...");
       run_daemon();
     }
     "stop" => {

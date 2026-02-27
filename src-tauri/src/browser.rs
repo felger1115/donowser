@@ -546,7 +546,11 @@ mod windows {
       for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "exe") {
-          let name = path.file_stem().unwrap_or_default().to_string_lossy();
+          let name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
           if name.starts_with("firefox")
             || name.starts_with("zen")
             || name.starts_with("camoufox")
@@ -608,8 +612,12 @@ mod windows {
     if let Ok(entries) = std::fs::read_dir(install_dir) {
       for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "exe") {
-          let name = path.file_stem().unwrap_or_default().to_string_lossy();
+        if path.extension().is_some_and(|ext| ext == "exe") && is_pe_executable(&path) {
+          let name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
           if name.contains("chromium")
             || name.contains("brave")
             || name.contains("chrome")
@@ -644,7 +652,11 @@ mod windows {
         let path = entry.path();
 
         if path.extension().is_some_and(|ext| ext == "exe") {
-          let name = path.file_stem().unwrap_or_default().to_string_lossy();
+          let name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
           if name.starts_with("firefox")
             || name.starts_with("zen")
             || name.starts_with("camoufox")
@@ -704,8 +716,12 @@ mod windows {
       for entry in entries.flatten() {
         let path = entry.path();
 
-        if path.extension().is_some_and(|ext| ext == "exe") {
-          let name = path.file_stem().unwrap_or_default().to_string_lossy();
+        if path.extension().is_some_and(|ext| ext == "exe") && is_pe_executable(&path) {
+          let name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
           if name.contains("chromium")
             || name.contains("brave")
             || name.contains("chrome")
@@ -1167,6 +1183,22 @@ impl BrowserFactory {
       BrowserType::Wayfern => Box::new(WayfernBrowser::new()),
     }
   }
+}
+
+/// Check if a file is a valid PE executable by reading its magic bytes (MZ).
+/// Returns false for archive files (.zip starts with PK, etc.) that were
+/// incorrectly named with a .exe extension.
+#[cfg(target_os = "windows")]
+fn is_pe_executable(path: &Path) -> bool {
+  use std::io::Read;
+  let Ok(mut file) = std::fs::File::open(path) else {
+    return false;
+  };
+  let mut magic = [0u8; 2];
+  if file.read_exact(&mut magic).is_err() {
+    return false;
+  }
+  magic == [0x4D, 0x5A] // MZ
 }
 
 // Factory function to create browser instances (kept for backward compatibility)

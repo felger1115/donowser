@@ -23,6 +23,7 @@ pub enum SyncWorkItem {
   Profile(String),
   Proxy(String),
   Group(String),
+  Vpn(String),
   Tombstone(String, String),
 }
 
@@ -53,6 +54,20 @@ impl SyncSubscription {
     app_handle: &tauri::AppHandle,
     work_tx: mpsc::UnboundedSender<SyncWorkItem>,
   ) -> Result<Option<Self>, String> {
+    // Cloud auth takes priority
+    if crate::cloud_auth::CLOUD_AUTH.is_logged_in().await {
+      let url = crate::cloud_auth::CLOUD_SYNC_URL.to_string();
+      let token = crate::cloud_auth::CLOUD_AUTH
+        .get_or_refresh_sync_token()
+        .await
+        .map_err(|e| format!("Failed to get cloud sync token: {e}"))?;
+      let Some(token) = token else {
+        return Ok(None);
+      };
+      return Ok(Some(Self::new(url, token, work_tx)));
+    }
+
+    // Fall back to self-hosted settings
     let manager = SettingsManager::instance();
     let settings = manager
       .load_settings()
@@ -215,6 +230,11 @@ impl SyncSubscription {
         .strip_prefix("groups/")
         .and_then(|s| s.strip_suffix(".json"))
         .map(|s| SyncWorkItem::Group(s.to_string()))
+    } else if key.starts_with("vpns/") {
+      key
+        .strip_prefix("vpns/")
+        .and_then(|s| s.strip_suffix(".json"))
+        .map(|s| SyncWorkItem::Vpn(s.to_string()))
     } else if key.starts_with("tombstones/") {
       key.strip_prefix("tombstones/").and_then(|rest| {
         if rest.starts_with("profiles/") {
@@ -232,6 +252,11 @@ impl SyncSubscription {
             .strip_prefix("groups/")
             .and_then(|s| s.strip_suffix(".json"))
             .map(|id| SyncWorkItem::Tombstone("group".to_string(), id.to_string()))
+        } else if rest.starts_with("vpns/") {
+          rest
+            .strip_prefix("vpns/")
+            .and_then(|s| s.strip_suffix(".json"))
+            .map(|id| SyncWorkItem::Tombstone("vpn".to_string(), id.to_string()))
         } else {
           None
         }

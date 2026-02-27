@@ -1,4 +1,3 @@
-use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -67,13 +66,7 @@ impl VersionUpdater {
   }
 
   fn get_cache_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let base_dirs = BaseDirs::new().ok_or("Failed to get base directories")?;
-    let app_name = if cfg!(debug_assertions) {
-      "DonutBrowserDev"
-    } else {
-      "DonutBrowser"
-    };
-    let cache_dir = base_dirs.cache_dir().join(app_name).join("version_cache");
+    let cache_dir = crate::app_dirs::cache_dir().join("version_cache");
     fs::create_dir_all(&cache_dir)?;
     Ok(cache_dir)
   }
@@ -265,6 +258,23 @@ impl VersionUpdater {
     app_handle: &tauri::AppHandle,
   ) -> Result<Vec<BackgroundUpdateResult>, Box<dyn std::error::Error + Send + Sync>> {
     let supported_browsers = self.browser_version_manager.get_supported_browsers();
+
+    // Only fetch versions for active browsers (wayfern, camoufox) plus any
+    // deprecated browsers that still have existing profiles
+    let active_browsers = ["wayfern", "camoufox"];
+    let browsers_with_profiles: std::collections::HashSet<String> =
+      crate::profile::ProfileManager::instance()
+        .list_profiles()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| p.browser.clone())
+        .collect();
+
+    let supported_browsers: Vec<String> = supported_browsers
+      .into_iter()
+      .filter(|b| active_browsers.contains(&b.as_str()) || browsers_with_profiles.contains(b))
+      .collect();
+
     let total_browsers = supported_browsers.len();
     let mut results = Vec::new();
     let mut total_new_versions = 0;

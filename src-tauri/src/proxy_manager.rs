@@ -1,5 +1,4 @@
 use chrono::Utc;
-use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -91,6 +90,8 @@ pub struct ProxyCheckResult {
   pub is_valid: bool,
 }
 
+pub const CLOUD_PROXY_ID: &str = "cloud-included-proxy";
+
 // Stored proxy configuration with name and ID for reuse
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredProxy {
@@ -101,16 +102,32 @@ pub struct StoredProxy {
   pub sync_enabled: bool,
   #[serde(default)]
   pub last_sync: Option<u64>,
+  #[serde(default)]
+  pub is_cloud_managed: bool,
+  #[serde(default)]
+  pub is_cloud_derived: bool,
+  #[serde(default)]
+  pub geo_country: Option<String>,
+  #[serde(default)]
+  pub geo_state: Option<String>,
+  #[serde(default)]
+  pub geo_city: Option<String>,
 }
 
 impl StoredProxy {
   pub fn new(name: String, proxy_settings: ProxySettings) -> Self {
+    let sync_enabled = crate::sync::is_sync_configured();
     Self {
       id: uuid::Uuid::new_v4().to_string(),
       name,
       proxy_settings,
-      sync_enabled: false,
+      sync_enabled,
       last_sync: None,
+      is_cloud_managed: false,
+      is_cloud_derived: false,
+      geo_country: None,
+      geo_state: None,
+      geo_city: None,
     }
   }
 
@@ -131,18 +148,15 @@ pub struct ProxyManager {
   // Track active proxy IDs by profile name for targeted cleanup
   profile_active_proxy_ids: Mutex<HashMap<String, String>>, // Maps profile name to proxy id
   stored_proxies: Mutex<HashMap<String, StoredProxy>>,      // Maps proxy ID to stored proxy
-  base_dirs: BaseDirs,
 }
 
 impl ProxyManager {
   pub fn new() -> Self {
-    let base_dirs = BaseDirs::new().expect("Failed to get base directories");
     let manager = Self {
       active_proxies: Mutex::new(HashMap::new()),
       profile_proxies: Mutex::new(HashMap::new()),
       profile_active_proxy_ids: Mutex::new(HashMap::new()),
       stored_proxies: Mutex::new(HashMap::new()),
-      base_dirs,
     };
 
     // Load stored proxies on initialization
@@ -153,27 +167,12 @@ impl ProxyManager {
     manager
   }
 
-  // Get the path to the proxies directory
   fn get_proxies_dir(&self) -> PathBuf {
-    let mut path = self.base_dirs.data_local_dir().to_path_buf();
-    path.push(if cfg!(debug_assertions) {
-      "DonutBrowserDev"
-    } else {
-      "DonutBrowser"
-    });
-    path.push("proxies");
-    path
+    crate::app_dirs::proxies_dir()
   }
 
-  // Get the path to the proxy check cache directory
   fn get_proxy_check_cache_dir(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut path = self.base_dirs.cache_dir().to_path_buf();
-    path.push(if cfg!(debug_assertions) {
-      "DonutBrowserDev"
-    } else {
-      "DonutBrowser"
-    });
-    path.push("proxy_checks");
+    let path = crate::app_dirs::cache_dir().join("proxy_checks");
     fs::create_dir_all(&path)?;
     Ok(path)
   }
@@ -226,8 +225,7 @@ impl ProxyManager {
       .as_secs()
   }
 
-  // Get geolocation for an IP address
-  async fn get_ip_geolocation(
+  pub async fn get_ip_geolocation(
     ip: &str,
   ) -> Result<(Option<String>, Option<String>, Option<String>), String> {
     // Use ip-api.com (free, no API key required)
@@ -392,7 +390,236 @@ impl ProxyManager {
       log::error!("Failed to emit proxies-changed event: {e}");
     }
 
+    if stored_proxy.sync_enabled {
+      if let Some(scheduler) = crate::sync::get_global_scheduler() {
+        let id = stored_proxy.id.clone();
+        tauri::async_runtime::spawn(async move {
+          scheduler.queue_proxy_sync(id).await;
+        });
+      }
+    }
+
     Ok(stored_proxy)
+  }
+
+  // Check if a cloud-managed proxy exists
+  pub fn has_cloud_proxy(&self) -> bool {
+    let stored_proxies = self.stored_proxies.lock().unwrap();
+    stored_proxies.contains_key(CLOUD_PROXY_ID)
+  }
+
+  // Upsert the cloud-managed proxy (create or update)
+  pub fn upsert_cloud_proxy(&self, proxy_settings: ProxySettings) -> Result<StoredProxy, String> {
+    let mut stored_proxies = self.stored_proxies.lock().unwrap();
+
+    if let Some(existing) = stored_proxies.get_mut(CLOUD_PROXY_ID) {
+      existing.proxy_settings = proxy_settings;
+      let updated = existing.clone();
+      drop(stored_proxies);
+
+      if let Err(e) = self.save_proxy(&updated) {
+        log::warn!("Failed to save cloud proxy: {e}");
+      }
+      if let Err(e) = events::emit_empty("proxies-changed") {
+        log::error!("Failed to emit proxies-changed event: {e}");
+      }
+      Ok(updated)
+    } else {
+      let cloud_proxy = StoredProxy {
+        id: CLOUD_PROXY_ID.to_string(),
+        name: "Included Proxy".to_string(),
+        proxy_settings,
+        sync_enabled: false,
+        last_sync: None,
+        is_cloud_managed: true,
+        is_cloud_derived: false,
+        geo_country: None,
+        geo_state: None,
+        geo_city: None,
+      };
+      stored_proxies.insert(CLOUD_PROXY_ID.to_string(), cloud_proxy.clone());
+      drop(stored_proxies);
+
+      if let Err(e) = self.save_proxy(&cloud_proxy) {
+        log::warn!("Failed to save cloud proxy: {e}");
+      }
+      if let Err(e) = events::emit_empty("proxies-changed") {
+        log::error!("Failed to emit proxies-changed event: {e}");
+      }
+      Ok(cloud_proxy)
+    }
+  }
+
+  // Remove the cloud-managed proxy
+  pub fn remove_cloud_proxy(&self) {
+    let removed = {
+      let mut stored_proxies = self.stored_proxies.lock().unwrap();
+      stored_proxies.remove(CLOUD_PROXY_ID).is_some()
+    };
+
+    if removed {
+      if let Err(e) = self.delete_proxy_file(CLOUD_PROXY_ID) {
+        log::warn!("Failed to delete cloud proxy file: {e}");
+      }
+      if let Err(e) = events::emit_empty("proxies-changed") {
+        log::error!("Failed to emit proxies-changed event: {e}");
+      }
+    }
+  }
+
+  // Build a geo-targeted username from base username and location parts
+  // LP format: username-zone-lightning-region-{country}-st-{state}-city-{city}
+  fn build_geo_username(
+    base_username: &str,
+    country: &str,
+    state: &Option<String>,
+    city: &Option<String>,
+  ) -> String {
+    let mut username = format!("{}-zone-lightning-region-{}", base_username, country);
+    if let Some(state) = state {
+      username = format!("{}-st-{}", username, state);
+    }
+    if let Some(city) = city {
+      username = format!("{}-city-{}", username, city);
+    }
+    username
+  }
+
+  // Create a cloud-derived location proxy from the base cloud proxy credentials
+  pub fn create_cloud_location_proxy(
+    &self,
+    name: String,
+    country: String,
+    state: Option<String>,
+    city: Option<String>,
+  ) -> Result<StoredProxy, String> {
+    // Get base cloud proxy credentials
+    let base_proxy = {
+      let stored_proxies = self.stored_proxies.lock().unwrap();
+      stored_proxies
+        .get(CLOUD_PROXY_ID)
+        .cloned()
+        .ok_or_else(|| "No cloud proxy available. Please log in first.".to_string())?
+    };
+
+    let base_username = base_proxy
+      .proxy_settings
+      .username
+      .as_ref()
+      .ok_or_else(|| "Cloud proxy has no username".to_string())?;
+
+    let geo_username = Self::build_geo_username(base_username, &country, &state, &city);
+
+    let proxy_settings = ProxySettings {
+      proxy_type: base_proxy.proxy_settings.proxy_type.clone(),
+      host: base_proxy.proxy_settings.host.clone(),
+      port: base_proxy.proxy_settings.port,
+      username: Some(geo_username),
+      password: base_proxy.proxy_settings.password.clone(),
+    };
+
+    // Check if name already exists
+    {
+      let stored_proxies = self.stored_proxies.lock().unwrap();
+      if stored_proxies.values().any(|p| p.name == name) {
+        return Err(format!("Proxy with name '{}' already exists", name));
+      }
+    }
+
+    let stored_proxy = StoredProxy {
+      id: uuid::Uuid::new_v4().to_string(),
+      name,
+      proxy_settings,
+      sync_enabled: false,
+      last_sync: None,
+      is_cloud_managed: false,
+      is_cloud_derived: true,
+      geo_country: Some(country),
+      geo_state: state,
+      geo_city: city,
+    };
+
+    {
+      let mut stored_proxies = self.stored_proxies.lock().unwrap();
+      stored_proxies.insert(stored_proxy.id.clone(), stored_proxy.clone());
+    }
+
+    if let Err(e) = self.save_proxy(&stored_proxy) {
+      log::warn!("Failed to save location proxy: {e}");
+    }
+
+    if let Err(e) = events::emit_empty("proxies-changed") {
+      log::error!("Failed to emit proxies-changed event: {e}");
+    }
+
+    Ok(stored_proxy)
+  }
+
+  // Update all cloud-derived proxies when base cloud proxy credentials change
+  pub fn update_cloud_derived_proxies(&self) {
+    let base_proxy = {
+      let stored_proxies = self.stored_proxies.lock().unwrap();
+      match stored_proxies.get(CLOUD_PROXY_ID) {
+        Some(p) => p.clone(),
+        None => return, // No cloud proxy, nothing to update
+      }
+    };
+
+    let base_username = match &base_proxy.proxy_settings.username {
+      Some(u) => u.clone(),
+      None => return,
+    };
+
+    let mut updated = false;
+    let mut stored_proxies = self.stored_proxies.lock().unwrap();
+
+    for proxy in stored_proxies.values_mut() {
+      if !proxy.is_cloud_derived {
+        continue;
+      }
+
+      let country = match &proxy.geo_country {
+        Some(c) => c.clone(),
+        None => continue,
+      };
+
+      let geo_username =
+        Self::build_geo_username(&base_username, &country, &proxy.geo_state, &proxy.geo_city);
+
+      proxy.proxy_settings.username = Some(geo_username);
+      proxy.proxy_settings.password = base_proxy.proxy_settings.password.clone();
+      proxy.proxy_settings.host = base_proxy.proxy_settings.host.clone();
+      proxy.proxy_settings.port = base_proxy.proxy_settings.port;
+
+      updated = true;
+    }
+
+    if updated {
+      // Save all updated proxies
+      let proxies_to_save: Vec<StoredProxy> = stored_proxies
+        .values()
+        .filter(|p| p.is_cloud_derived)
+        .cloned()
+        .collect();
+      drop(stored_proxies);
+
+      for proxy in &proxies_to_save {
+        if let Err(e) = self.save_proxy(proxy) {
+          log::warn!("Failed to save updated derived proxy {}: {e}", proxy.id);
+        }
+      }
+
+      if let Err(e) = events::emit_empty("proxies-changed") {
+        log::error!("Failed to emit proxies-changed event: {e}");
+      }
+
+      log::debug!("Updated {} cloud-derived proxies", proxies_to_save.len());
+    }
+  }
+
+  pub fn remove_from_memory(&self, proxy_id: &str) {
+    let mut stored_proxies = self.stored_proxies.lock().unwrap();
+    stored_proxies.remove(proxy_id);
   }
 
   // Get all stored proxies
@@ -421,6 +648,14 @@ impl ProxyManager {
       // Check if proxy exists
       if !stored_proxies.contains_key(proxy_id) {
         return Err(format!("Proxy with ID '{proxy_id}' not found"));
+      }
+
+      // Block editing cloud-managed proxies
+      if stored_proxies
+        .get(proxy_id)
+        .is_some_and(|p| p.is_cloud_managed)
+      {
+        return Err("Cannot edit a cloud-managed proxy".to_string());
       }
 
       // Check if new name conflicts with existing proxies
@@ -459,6 +694,15 @@ impl ProxyManager {
       log::error!("Failed to emit proxies-changed event: {e}");
     }
 
+    if updated_proxy.sync_enabled {
+      if let Some(scheduler) = crate::sync::get_global_scheduler() {
+        let id = updated_proxy.id.clone();
+        tauri::async_runtime::spawn(async move {
+          scheduler.queue_proxy_sync(id).await;
+        });
+      }
+    }
+
     Ok(updated_proxy)
   }
 
@@ -471,6 +715,15 @@ impl ProxyManager {
     // Remember if sync was enabled before deleting
     let was_sync_enabled = {
       let stored_proxies = self.stored_proxies.lock().unwrap();
+
+      // Block deleting cloud-managed proxies
+      if stored_proxies
+        .get(proxy_id)
+        .is_some_and(|p| p.is_cloud_managed)
+      {
+        return Err("Cannot delete a cloud-managed proxy".to_string());
+      }
+
       stored_proxies
         .get(proxy_id)
         .map(|p| p.sync_enabled)
@@ -601,6 +854,7 @@ impl ProxyManager {
     let stored_proxies = self.stored_proxies.lock().unwrap();
     let proxies: Vec<ExportedProxy> = stored_proxies
       .values()
+      .filter(|p| !p.is_cloud_managed && !p.is_cloud_derived)
       .map(|p| ExportedProxy {
         name: p.name.clone(),
         proxy_type: p.proxy_settings.proxy_type.clone(),
@@ -626,6 +880,7 @@ impl ProxyManager {
     let stored_proxies = self.stored_proxies.lock().unwrap();
     stored_proxies
       .values()
+      .filter(|p| !p.is_cloud_managed && !p.is_cloud_derived)
       .map(|p| Self::build_proxy_url(&p.proxy_settings))
       .collect::<Vec<_>>()
       .join("\n")
@@ -1375,6 +1630,27 @@ impl ProxyManager {
       delete_proxy_config(&config.id);
     }
 
+    // Clean up orphaned VPN worker configs where the worker process is dead
+    {
+      use crate::proxy_storage::is_process_running;
+      use crate::vpn_worker_storage::{delete_vpn_worker_config, list_vpn_worker_configs};
+
+      let vpn_workers = list_vpn_worker_configs();
+      for worker in vpn_workers {
+        if let Some(pid) = worker.pid {
+          if !is_process_running(pid) {
+            log::info!(
+              "Cleaning up orphaned VPN worker config: {} (process PID {} is dead)",
+              worker.id,
+              pid
+            );
+            let _ = std::fs::remove_file(&worker.config_file_path);
+            delete_vpn_worker_config(&worker.id);
+          }
+        }
+      }
+    }
+
     // Emit event for reactive UI updates
     if let Err(e) = events::emit_empty("proxies-changed") {
       log::error!("Failed to emit proxies-changed event: {e}");
@@ -1415,11 +1691,16 @@ mod tests {
       .parent()
       .unwrap()
       .to_path_buf();
+    let proxy_binary_name = if cfg!(windows) {
+      "donut-proxy.exe"
+    } else {
+      "donut-proxy"
+    };
     let proxy_binary = project_root
       .join("src-tauri")
       .join("target")
       .join("debug")
-      .join("donut-proxy");
+      .join(proxy_binary_name);
 
     // Check if binary already exists
     if proxy_binary.exists() {

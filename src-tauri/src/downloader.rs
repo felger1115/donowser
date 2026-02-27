@@ -434,6 +434,13 @@ impl Downloader {
     Ok(())
   }
 
+  fn configure_camoufox_search_engine(
+    &self,
+    browser_dir: &Path,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    configure_camoufox_search_engine(browser_dir)
+  }
+
   pub async fn download_browser<R: tauri::Runtime>(
     &self,
     _app_handle: &tauri::AppHandle<R>,
@@ -674,21 +681,7 @@ impl Downloader {
 
     // Use injected registry instance
 
-    // Get binaries directory - we need to get it from somewhere
-    // This is a bit tricky since we don't have access to BrowserRunner's get_binaries_dir
-    // We'll need to replicate this logic
-    let binaries_dir = if let Some(base_dirs) = directories::BaseDirs::new() {
-      let mut path = base_dirs.data_local_dir().to_path_buf();
-      path.push(if cfg!(debug_assertions) {
-        "DonutBrowserDev"
-      } else {
-        "DonutBrowser"
-      });
-      path.push("binaries");
-      path
-    } else {
-      return Err("Failed to get base directories".into());
-    };
+    let binaries_dir = crate::app_dirs::binaries_dir();
 
     // Check if registry thinks it's downloaded, but also verify files actually exist
     if self.registry.is_browser_downloaded(&browser_str, &version) {
@@ -975,7 +968,10 @@ impl Downloader {
         .await
       {
         log::warn!("Failed to create version.json for Camoufox: {e}");
-        // Don't fail the download if version.json creation fails
+      }
+
+      if let Err(e) = self.configure_camoufox_search_engine(&browser_dir) {
+        log::warn!("Failed to configure Camoufox search engine: {e}");
       }
     }
 
@@ -1035,6 +1031,61 @@ pub async fn cancel_download(browser_str: String, version: String) -> Result<(),
       "No active download found for {browser_str} {version}"
     ))
   }
+}
+
+/// Set DuckDuckGo as the default search engine in Camoufox policies.json.
+/// Removes the fake "None" search engine and explicitly sets DuckDuckGo as default.
+/// Called both at download time and at launch time to cover existing installations.
+pub fn configure_camoufox_search_engine(
+  browser_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  let policies_path = browser_dir.join("distribution").join("policies.json");
+
+  if !policies_path.exists() {
+    return Ok(());
+  }
+
+  let content = std::fs::read_to_string(&policies_path)?;
+  let mut policies: serde_json::Value = serde_json::from_str(&content)?;
+
+  let current_default = policies
+    .get("policies")
+    .and_then(|p| p.get("SearchEngines"))
+    .and_then(|se| se.get("Default"))
+    .and_then(|d| d.as_str())
+    .unwrap_or("");
+
+  if current_default == "DuckDuckGo" {
+    return Ok(());
+  }
+
+  if let Some(policies_obj) = policies.get_mut("policies") {
+    if let Some(se) = policies_obj.get_mut("SearchEngines") {
+      // Set DuckDuckGo as the explicit default
+      if let Some(obj) = se.as_object_mut() {
+        obj.insert(
+          "Default".to_string(),
+          serde_json::Value::String("DuckDuckGo".to_string()),
+        );
+      }
+
+      // Remove the fake "None" search engine entry from Add
+      if let Some(add_arr) = se.get_mut("Add").and_then(|a| a.as_array_mut()) {
+        add_arr.retain(|entry| entry.get("Name").and_then(|n| n.as_str()) != Some("None"));
+      }
+
+      // Ensure DuckDuckGo is not in the Remove list
+      if let Some(remove_arr) = se.get_mut("Remove").and_then(|r| r.as_array_mut()) {
+        remove_arr.retain(|v| v.as_str() != Some("DuckDuckGo"));
+      }
+    }
+  }
+
+  let updated = serde_json::to_string_pretty(&policies)?;
+  std::fs::write(&policies_path, updated)?;
+  log::info!("Set DuckDuckGo as default search engine in Camoufox policies.json");
+
+  Ok(())
 }
 
 #[cfg(test)]

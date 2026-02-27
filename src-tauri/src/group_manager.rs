@@ -1,8 +1,6 @@
-use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::events;
@@ -33,48 +31,15 @@ struct GroupsData {
   groups: Vec<ProfileGroup>,
 }
 
-pub struct GroupManager {
-  base_dirs: BaseDirs,
-  data_dir_override: Option<PathBuf>,
-}
+pub struct GroupManager;
 
 impl GroupManager {
   pub fn new() -> Self {
-    Self {
-      base_dirs: BaseDirs::new().expect("Failed to get base directories"),
-      data_dir_override: std::env::var("DONUTBROWSER_DATA_DIR")
-        .ok()
-        .map(PathBuf::from),
-    }
+    Self
   }
 
-  // Helper for tests to override data directory without global env var
-  #[allow(dead_code)]
-  pub fn with_data_dir_override(dir: &Path) -> Self {
-    Self {
-      base_dirs: BaseDirs::new().expect("Failed to get base directories"),
-      data_dir_override: Some(dir.to_path_buf()),
-    }
-  }
-
-  fn get_groups_file_path(&self) -> PathBuf {
-    if let Some(dir) = &self.data_dir_override {
-      let mut override_path = dir.clone();
-      // Ensure the directory exists before returning the path
-      let _ = fs::create_dir_all(&override_path);
-      override_path.push("groups.json");
-      return override_path;
-    }
-
-    let mut path = self.base_dirs.data_local_dir().to_path_buf();
-    path.push(if cfg!(debug_assertions) {
-      "DonutBrowserDev"
-    } else {
-      "DonutBrowser"
-    });
-    path.push("data");
-    path.push("groups.json");
-    path
+  fn get_groups_file_path(&self) -> std::path::PathBuf {
+    crate::app_dirs::data_subdir().join("groups.json")
   }
 
   fn load_groups_data(&self) -> Result<GroupsData, Box<dyn std::error::Error>> {
@@ -119,10 +84,11 @@ impl GroupManager {
       return Err(format!("Group with name '{name}' already exists").into());
     }
 
+    let sync_enabled = crate::sync::is_sync_configured();
     let group = ProfileGroup {
       id: uuid::Uuid::new_v4().to_string(),
       name,
-      sync_enabled: false,
+      sync_enabled,
       last_sync: None,
     };
 
@@ -132,6 +98,15 @@ impl GroupManager {
     // Emit event for reactive UI updates
     if let Err(e) = events::emit_empty("groups-changed") {
       log::error!("Failed to emit groups-changed event: {e}");
+    }
+
+    if group.sync_enabled {
+      if let Some(scheduler) = crate::sync::get_global_scheduler() {
+        let id = group.id.clone();
+        tauri::async_runtime::spawn(async move {
+          scheduler.queue_group_sync(id).await;
+        });
+      }
     }
 
     Ok(group)
@@ -170,6 +145,15 @@ impl GroupManager {
       log::error!("Failed to emit groups-changed event: {e}");
     }
 
+    if updated_group.sync_enabled {
+      if let Some(scheduler) = crate::sync::get_global_scheduler() {
+        let id = updated_group.id.clone();
+        tauri::async_runtime::spawn(async move {
+          scheduler.queue_group_sync(id).await;
+        });
+      }
+    }
+
     Ok(updated_group)
   }
 
@@ -203,6 +187,17 @@ impl GroupManager {
       groups_data.groups.push(group.clone());
     }
 
+    self.save_groups_data(&groups_data)?;
+    Ok(())
+  }
+
+  pub fn delete_group_internal(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut groups_data = self.load_groups_data()?;
+    let initial_len = groups_data.groups.len();
+    groups_data.groups.retain(|g| g.id != id);
+    if groups_data.groups.len() == initial_len {
+      return Err(format!("Group with id '{id}' not found").into());
+    }
     self.save_groups_data(&groups_data)?;
     Ok(())
   }

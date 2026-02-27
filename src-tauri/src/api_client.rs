@@ -1,4 +1,3 @@
-use directories::BaseDirs;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -334,7 +333,7 @@ pub struct BrowserRelease {
   pub is_prerelease: bool,
 }
 
-/// Wayfern version info from https://download.wayfern.com/version.json
+/// Wayfern version info from https://donutbrowser.com/wayfern.json
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WayfernVersionInfo {
   pub version: String,
@@ -464,13 +463,7 @@ impl ApiClient {
   }
 
   fn get_cache_dir() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let base_dirs = BaseDirs::new().ok_or("Failed to get base directories")?;
-    let app_name = if cfg!(debug_assertions) {
-      "DonutBrowserDev"
-    } else {
-      "DonutBrowser"
-    };
-    let cache_dir = base_dirs.cache_dir().join(app_name).join("version_cache");
+    let cache_dir = crate::app_dirs::cache_dir().join("version_cache");
     fs::create_dir_all(&cache_dir)?;
     Ok(cache_dir)
   }
@@ -1115,7 +1108,7 @@ impl ApiClient {
     Ok(())
   }
 
-  /// Fetch Wayfern version info from https://download.wayfern.com/version.json
+  /// Fetch Wayfern version info from https://donutbrowser.com/wayfern.json
   pub async fn fetch_wayfern_version_with_caching(
     &self,
     no_caching: bool,
@@ -1128,8 +1121,8 @@ impl ApiClient {
       }
     }
 
-    log::info!("Fetching Wayfern version from https://download.wayfern.com/version.json");
-    let url = "https://download.wayfern.com/version.json";
+    log::info!("Fetching Wayfern version from https://donutbrowser.com/wayfern.json");
+    let url = "https://donutbrowser.com/wayfern.json";
 
     let response = self
       .client

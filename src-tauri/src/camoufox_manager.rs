@@ -1,7 +1,6 @@
 use crate::browser_runner::BrowserRunner;
 use crate::camoufox::{CamoufoxConfigBuilder, GeoIPOption, ScreenConstraints};
 use crate::profile::BrowserProfile;
-use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -74,7 +73,6 @@ struct CamoufoxManagerInner {
 
 pub struct CamoufoxManager {
   inner: Arc<AsyncMutex<CamoufoxManagerInner>>,
-  base_dirs: BaseDirs,
 }
 
 impl CamoufoxManager {
@@ -83,7 +81,6 @@ impl CamoufoxManager {
       inner: Arc::new(AsyncMutex::new(CamoufoxManagerInner {
         instances: HashMap::new(),
       })),
-      base_dirs: BaseDirs::new().expect("Failed to get base directories"),
     }
   }
 
@@ -92,14 +89,7 @@ impl CamoufoxManager {
   }
 
   pub fn get_profiles_dir(&self) -> PathBuf {
-    let mut path = self.base_dirs.data_local_dir().to_path_buf();
-    path.push(if cfg!(debug_assertions) {
-      "DonutBrowserDev"
-    } else {
-      "DonutBrowser"
-    });
-    path.push("profiles");
-    path
+    crate::app_dirs::profiles_dir()
   }
 
   /// Generate Camoufox fingerprint configuration during profile creation
@@ -111,7 +101,15 @@ impl CamoufoxManager {
   ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // Get executable path
     let executable_path = if let Some(path) = &config.executable_path {
-      PathBuf::from(path)
+      let p = PathBuf::from(path);
+      if p.exists() {
+        p
+      } else {
+        log::warn!("Stored Camoufox executable path does not exist: {path}, falling back to dynamic resolution");
+        BrowserRunner::instance()
+          .get_browser_executable_path(profile)
+          .map_err(|e| format!("Failed to get Camoufox executable path: {e}"))?
+      }
     } else {
       BrowserRunner::instance()
         .get_browser_executable_path(profile)
@@ -204,7 +202,15 @@ impl CamoufoxManager {
 
     // Get executable path
     let executable_path = if let Some(path) = &config.executable_path {
-      PathBuf::from(path)
+      let p = PathBuf::from(path);
+      if p.exists() {
+        p
+      } else {
+        log::warn!("Stored Camoufox executable path does not exist: {path}, falling back to dynamic resolution");
+        BrowserRunner::instance()
+          .get_browser_executable_path(profile)
+          .map_err(|e| format!("Failed to get Camoufox executable path: {e}"))?
+      }
     } else {
       BrowserRunner::instance()
         .get_browser_executable_path(profile)
@@ -360,8 +366,11 @@ impl CamoufoxManager {
 
     #[cfg(windows)]
     {
+      use std::os::windows::process::CommandExt;
+      const CREATE_NO_WINDOW: u32 = 0x08000000;
       let result = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T"])
+        .creation_flags(CREATE_NO_WINDOW)
         .status();
 
       match result {
@@ -576,10 +585,15 @@ impl CamoufoxManager {
     profile: BrowserProfile,
     config: CamoufoxConfig,
     url: Option<String>,
+    override_profile_path: Option<std::path::PathBuf>,
   ) -> Result<CamoufoxLaunchResult, String> {
     // Get profile path
-    let profiles_dir = self.get_profiles_dir();
-    let profile_path = profile.get_profile_data_path(&profiles_dir);
+    let profile_path = if let Some(ref override_path) = override_profile_path {
+      override_path.clone()
+    } else {
+      let profiles_dir = self.get_profiles_dir();
+      profile.get_profile_data_path(&profiles_dir)
+    };
     let profile_path_str = profile_path.to_string_lossy();
 
     // Check if there's already a running instance for this profile
@@ -590,6 +604,29 @@ impl CamoufoxManager {
 
     // Clean up any dead instances before launching
     let _ = self.cleanup_dead_instances().await;
+
+    // For ephemeral profiles, write Firefox prefs to minimize disk writes
+    if override_profile_path.is_some() {
+      let user_js_path = profile_path.join("user.js");
+      let prefs = concat!(
+        "user_pref(\"browser.cache.disk.enable\", false);\n",
+        "user_pref(\"browser.cache.memory.enable\", true);\n",
+        "user_pref(\"browser.sessionstore.resume_from_crash\", false);\n",
+        "user_pref(\"browser.sessionstore.max_tabs_undo\", 0);\n",
+        "user_pref(\"browser.sessionstore.max_windows_undo\", 0);\n",
+        "user_pref(\"places.history.enabled\", false);\n",
+        "user_pref(\"browser.formfill.enable\", false);\n",
+        "user_pref(\"signon.rememberSignons\", false);\n",
+        "user_pref(\"browser.bookmarks.max_backups\", 0);\n",
+        "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n",
+        "user_pref(\"toolkit.crashreporter.enabled\", false);\n",
+        "user_pref(\"browser.pagethumbnails.capturing_disabled\", true);\n",
+        "user_pref(\"browser.download.manager.addToRecentDocs\", false);\n",
+      );
+      if let Err(e) = std::fs::write(&user_js_path, prefs) {
+        log::warn!("Failed to write ephemeral user.js: {e}");
+      }
+    }
 
     self
       .launch_camoufox(

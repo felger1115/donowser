@@ -11,6 +11,7 @@ static PENDING_URLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 mod api_client;
 mod api_server;
 mod app_auto_updater;
+pub mod app_dirs;
 mod auto_updater;
 mod browser;
 mod browser_runner;
@@ -20,6 +21,7 @@ mod camoufox_manager;
 mod default_browser;
 mod downloaded_browsers_registry;
 mod downloader;
+mod ephemeral_dirs;
 mod extraction;
 mod geoip_downloader;
 mod group_manager;
@@ -37,6 +39,7 @@ pub mod traffic_stats;
 mod wayfern_manager;
 mod wayfern_terms;
 // mod theme_detector; // removed: theme detection handled in webview via CSS prefers-color-scheme
+pub mod cloud_auth;
 mod commercial_license;
 mod cookie_manager;
 pub mod daemon;
@@ -48,6 +51,8 @@ mod mcp_server;
 mod tag_manager;
 mod version_updater;
 pub mod vpn;
+pub mod vpn_worker_runner;
+pub mod vpn_worker_storage;
 
 use browser_runner::{
   check_browser_exists, kill_browser_profile, launch_browser_profile, open_url_with_profile,
@@ -56,7 +61,7 @@ use browser_runner::{
 use profile::manager::{
   check_browser_status, clone_profile, create_browser_profile_new, delete_profile,
   list_browser_profiles, rename_profile, update_camoufox_config, update_profile_note,
-  update_profile_proxy, update_profile_tags, update_wayfern_config,
+  update_profile_proxy, update_profile_tags, update_profile_vpn, update_wayfern_config,
 };
 
 use browser_version_manager::{
@@ -66,20 +71,24 @@ use browser_version_manager::{
 };
 
 use downloaded_browsers_registry::{
-  check_missing_binaries, ensure_all_binaries_exist, get_downloaded_browser_versions,
+  check_missing_binaries, ensure_active_browsers_downloaded, ensure_all_binaries_exist,
+  get_downloaded_browser_versions,
 };
 
 use downloader::{cancel_download, download_browser};
 
 use settings_manager::{
-  decline_launch_on_login, enable_launch_on_login, get_app_settings, get_sync_settings,
-  get_system_language, get_table_sorting_settings, save_app_settings, save_sync_settings,
+  decline_launch_on_login, dismiss_window_resize_warning, enable_launch_on_login, get_app_settings,
+  get_sync_settings, get_system_language, get_table_sorting_settings,
+  get_window_resize_warning_dismissed, save_app_settings, save_sync_settings,
   save_table_sorting_settings, should_show_launch_on_login_prompt,
 };
 
 use sync::{
-  is_group_in_use_by_synced_profile, is_proxy_in_use_by_synced_profile, request_profile_sync,
-  set_group_sync_enabled, set_profile_sync_enabled, set_proxy_sync_enabled,
+  check_has_e2e_password, delete_e2e_password, enable_sync_for_all_entities,
+  get_unsynced_entity_counts, is_group_in_use_by_synced_profile, is_proxy_in_use_by_synced_profile,
+  is_vpn_in_use_by_synced_profile, request_profile_sync, set_e2e_password, set_group_sync_enabled,
+  set_profile_sync_mode, set_proxy_sync_enabled, set_vpn_sync_enabled,
 };
 
 use tag_manager::get_all_tags;
@@ -278,7 +287,39 @@ async fn copy_profile_cookies(
   app_handle: tauri::AppHandle,
   request: cookie_manager::CookieCopyRequest,
 ) -> Result<Vec<cookie_manager::CookieCopyResult>, String> {
+  if !crate::cloud_auth::CLOUD_AUTH
+    .has_active_paid_subscription()
+    .await
+  {
+    return Err("Cookie copying requires an active Pro subscription".to_string());
+  }
   cookie_manager::CookieManager::copy_cookies(&app_handle, request).await
+}
+
+#[tauri::command]
+async fn import_cookies_from_file(
+  app_handle: tauri::AppHandle,
+  profile_id: String,
+  content: String,
+) -> Result<cookie_manager::CookieImportResult, String> {
+  if !crate::cloud_auth::CLOUD_AUTH
+    .has_active_paid_subscription()
+    .await
+  {
+    return Err("Cookie import requires an active Pro subscription".to_string());
+  }
+  cookie_manager::CookieManager::import_cookies(&app_handle, &profile_id, &content).await
+}
+
+#[tauri::command]
+async fn export_profile_cookies(profile_id: String, format: String) -> Result<String, String> {
+  if !crate::cloud_auth::CLOUD_AUTH
+    .has_active_paid_subscription()
+    .await
+  {
+    return Err("Cookie export requires an active Pro subscription".to_string());
+  }
+  cookie_manager::CookieManager::export_cookies(&profile_id, &format)
 }
 
 #[tauri::command]
@@ -427,13 +468,23 @@ async fn import_vpn_config(
     .map_err(|e| format!("Failed to lock VPN storage: {e}"))?;
 
   match storage.import_config(&content, &filename, name.clone()) {
-    Ok(config) => Ok(vpn::VpnImportResult {
-      success: true,
-      vpn_id: Some(config.id),
-      vpn_type: Some(config.vpn_type),
-      name: config.name,
-      error: None,
-    }),
+    Ok(config) => {
+      if config.sync_enabled {
+        if let Some(scheduler) = sync::get_global_scheduler() {
+          let id = config.id.clone();
+          tauri::async_runtime::spawn(async move {
+            scheduler.queue_vpn_sync(id).await;
+          });
+        }
+      }
+      Ok(vpn::VpnImportResult {
+        success: true,
+        vpn_id: Some(config.id),
+        vpn_type: Some(config.vpn_type),
+        name: config.name,
+        error: None,
+      })
+    }
     Err(e) => Ok(vpn::VpnImportResult {
       success: false,
       vpn_id: None,
@@ -467,68 +518,167 @@ async fn get_vpn_config(vpn_id: String) -> Result<vpn::VpnConfig, String> {
 }
 
 #[tauri::command]
-async fn delete_vpn_config(vpn_id: String) -> Result<(), String> {
-  // First disconnect if connected
+async fn delete_vpn_config(app_handle: tauri::AppHandle, vpn_id: String) -> Result<(), String> {
+  // First disconnect if connected (stop VPN worker)
+  let _ = vpn_worker_runner::stop_vpn_worker_by_vpn_id(&vpn_id).await;
+
+  // Check if sync was enabled before deleting
+  let was_sync_enabled = {
+    let storage = vpn::VPN_STORAGE
+      .lock()
+      .map_err(|e| format!("Failed to lock VPN storage: {e}"))?;
+    storage
+      .load_config(&vpn_id)
+      .map(|c| c.sync_enabled)
+      .unwrap_or(false)
+  };
+
+  // Delete from storage
   {
-    let mut manager = vpn::TUNNEL_MANAGER.lock().await;
-    if manager.is_tunnel_active(&vpn_id) {
-      if let Some(tunnel) = manager.get_tunnel_mut(&vpn_id) {
-        let _ = tunnel.disconnect().await;
-      }
-      manager.remove_tunnel(&vpn_id);
-    }
+    let storage = vpn::VPN_STORAGE
+      .lock()
+      .map_err(|e| format!("Failed to lock VPN storage: {e}"))?;
+
+    storage
+      .delete_config(&vpn_id)
+      .map_err(|e| format!("Failed to delete VPN config: {e}"))?;
   }
 
-  // Then delete from storage
-  let storage = vpn::VPN_STORAGE
-    .lock()
-    .map_err(|e| format!("Failed to lock VPN storage: {e}"))?;
+  // If sync was enabled, also delete from remote
+  if was_sync_enabled {
+    let vpn_id_clone = vpn_id.clone();
+    let app_handle_clone = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+      match sync::SyncEngine::create_from_settings(&app_handle_clone).await {
+        Ok(engine) => {
+          if let Err(e) = engine.delete_vpn(&vpn_id_clone).await {
+            log::warn!("Failed to delete VPN {} from sync: {}", vpn_id_clone, e);
+          } else {
+            log::info!("VPN {} deleted from sync storage", vpn_id_clone);
+          }
+        }
+        Err(e) => {
+          log::debug!("Sync not configured, skipping remote VPN deletion: {}", e);
+        }
+      }
+    });
+  }
 
-  storage
-    .delete_config(&vpn_id)
-    .map_err(|e| format!("Failed to delete VPN config: {e}"))
+  let _ = events::emit("vpn-configs-changed", ());
+
+  Ok(())
 }
 
 #[tauri::command]
-async fn connect_vpn(vpn_id: String) -> Result<(), String> {
-  // Load config from storage
+async fn create_vpn_config_manual(
+  name: String,
+  vpn_type: vpn::VpnType,
+  config_data: String,
+) -> Result<vpn::VpnConfig, String> {
   let config = {
     let storage = vpn::VPN_STORAGE
       .lock()
       .map_err(|e| format!("Failed to lock VPN storage: {e}"))?;
 
     storage
-      .load_config(&vpn_id)
-      .map_err(|e| format!("Failed to load VPN config: {e}"))?
+      .create_config_manual(&name, vpn_type, &config_data)
+      .map_err(|e| format!("Failed to create VPN config: {e}"))?
   };
 
-  // Create and connect the appropriate tunnel
-  let mut manager = vpn::TUNNEL_MANAGER.lock().await;
-
-  // Check if already connected
-  if manager.is_tunnel_active(&vpn_id) {
-    return Ok(());
+  if config.sync_enabled {
+    if let Some(scheduler) = sync::get_global_scheduler() {
+      let id = config.id.clone();
+      tauri::async_runtime::spawn(async move {
+        scheduler.queue_vpn_sync(id).await;
+      });
+    }
   }
 
-  let mut tunnel: Box<dyn vpn::VpnTunnel> = match config.vpn_type {
-    vpn::VpnType::WireGuard => {
-      let wg_config = vpn::parse_wireguard_config(&config.config_data)
-        .map_err(|e| format!("Invalid WireGuard config: {e}"))?;
-      Box::new(vpn::WireGuardTunnel::new(vpn_id.clone(), wg_config))
+  Ok(config)
+}
+
+#[tauri::command]
+async fn update_vpn_config(vpn_id: String, name: String) -> Result<vpn::VpnConfig, String> {
+  let config = {
+    let storage = vpn::VPN_STORAGE
+      .lock()
+      .map_err(|e| format!("Failed to lock VPN storage: {e}"))?;
+
+    storage
+      .update_config_name(&vpn_id, &name)
+      .map_err(|e| format!("Failed to update VPN config: {e}"))?
+  };
+
+  if config.sync_enabled {
+    if let Some(scheduler) = sync::get_global_scheduler() {
+      let id = config.id.clone();
+      tauri::async_runtime::spawn(async move {
+        scheduler.queue_vpn_sync(id).await;
+      });
     }
-    vpn::VpnType::OpenVPN => {
-      let ovpn_config = vpn::parse_openvpn_config(&config.config_data)
-        .map_err(|e| format!("Invalid OpenVPN config: {e}"))?;
-      Box::new(vpn::OpenVpnTunnel::new(vpn_id.clone(), ovpn_config))
+  }
+
+  Ok(config)
+}
+
+#[tauri::command]
+async fn check_vpn_validity(
+  vpn_id: String,
+) -> Result<crate::proxy_manager::ProxyCheckResult, String> {
+  let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs();
+
+  // Start a temporary VPN worker to send real traffic
+  let vpn_worker = vpn_worker_runner::start_vpn_worker(&vpn_id)
+    .await
+    .map_err(|e| format!("Failed to start VPN worker: {e}"))?;
+
+  let socks_url = format!("socks5://127.0.0.1:{}", vpn_worker.local_port.unwrap_or(0));
+
+  // Fetch public IP through the VPN SOCKS5 proxy
+  let result = match ip_utils::fetch_public_ip(Some(&socks_url)).await {
+    Ok(ip) => {
+      let (city, country, country_code) =
+        crate::proxy_manager::ProxyManager::get_ip_geolocation(&ip)
+          .await
+          .unwrap_or_default();
+
+      crate::proxy_manager::ProxyCheckResult {
+        ip,
+        city,
+        country,
+        country_code,
+        timestamp: now,
+        is_valid: true,
+      }
+    }
+    Err(e) => {
+      log::warn!("VPN check failed to fetch public IP: {e}");
+      crate::proxy_manager::ProxyCheckResult {
+        ip: String::new(),
+        city: None,
+        country: None,
+        country_code: None,
+        timestamp: now,
+        is_valid: false,
+      }
     }
   };
 
-  tunnel
-    .connect()
+  // Stop the temporary VPN worker
+  let _ = vpn_worker_runner::stop_vpn_worker(&vpn_worker.id).await;
+
+  Ok(result)
+}
+
+#[tauri::command]
+async fn connect_vpn(vpn_id: String) -> Result<(), String> {
+  // Start VPN worker process (detached, survives GUI shutdown)
+  vpn_worker_runner::start_vpn_worker(&vpn_id)
     .await
     .map_err(|e| format!("Failed to connect VPN: {e}"))?;
-
-  manager.register_tunnel(vpn_id.clone(), tunnel);
 
   // Update last_used timestamp
   {
@@ -543,27 +693,27 @@ async fn connect_vpn(vpn_id: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn disconnect_vpn(vpn_id: String) -> Result<(), String> {
-  let mut manager = vpn::TUNNEL_MANAGER.lock().await;
-
-  if let Some(tunnel) = manager.get_tunnel_mut(&vpn_id) {
-    tunnel
-      .disconnect()
-      .await
-      .map_err(|e| format!("Failed to disconnect VPN: {e}"))?;
-  }
-
-  manager.remove_tunnel(&vpn_id);
+  vpn_worker_runner::stop_vpn_worker_by_vpn_id(&vpn_id)
+    .await
+    .map_err(|e| format!("Failed to disconnect VPN: {e}"))?;
   Ok(())
 }
 
 #[tauri::command]
 async fn get_vpn_status(vpn_id: String) -> Result<vpn::VpnStatus, String> {
-  let manager = vpn::TUNNEL_MANAGER.lock().await;
+  use crate::proxy_storage::is_process_running;
 
-  if let Some(tunnel) = manager.get_tunnel(&vpn_id) {
-    Ok(tunnel.get_status())
+  if let Some(worker) = vpn_worker_storage::find_vpn_worker_by_vpn_id(&vpn_id) {
+    let connected = worker.pid.map(is_process_running).unwrap_or(false);
+    Ok(vpn::VpnStatus {
+      connected,
+      vpn_id,
+      connected_at: None,
+      bytes_sent: None,
+      bytes_received: None,
+      last_handshake: None,
+    })
   } else {
-    // Not connected
     Ok(vpn::VpnStatus {
       connected: false,
       vpn_id,
@@ -577,8 +727,23 @@ async fn get_vpn_status(vpn_id: String) -> Result<vpn::VpnStatus, String> {
 
 #[tauri::command]
 async fn list_active_vpn_connections() -> Result<Vec<vpn::VpnStatus>, String> {
-  let manager = vpn::TUNNEL_MANAGER.lock().await;
-  Ok(manager.get_all_statuses())
+  use crate::proxy_storage::is_process_running;
+
+  let workers = vpn_worker_storage::list_vpn_worker_configs();
+  Ok(
+    workers
+      .into_iter()
+      .filter(|w| w.pid.map(is_process_running).unwrap_or(false))
+      .map(|w| vpn::VpnStatus {
+        connected: true,
+        vpn_id: w.vpn_id,
+        connected_at: None,
+        bytes_sent: None,
+        bytes_received: None,
+        last_handshake: None,
+      })
+      .collect(),
+  )
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -592,12 +757,7 @@ pub fn run() {
     pending.push(url.clone());
   }
 
-  // Configure logging plugin with separate logs for dev and production
-  let log_file_name = if cfg!(debug_assertions) {
-    "DonutBrowserDev"
-  } else {
-    "DonutBrowser"
-  };
+  let log_file_name = app_dirs::app_name();
 
   tauri::Builder::default()
     .plugin(
@@ -628,9 +788,16 @@ pub fn run() {
         })
         .build(),
     )
-    .plugin(tauri_plugin_single_instance::init(|_, args, _cwd| {
-      log::info!("Single instance triggered with args: {args:?}");
-    }))
+    .plugin(tauri_plugin_single_instance::init(
+      |app_handle, args, _cwd| {
+        log::info!("Single instance triggered with args: {args:?}");
+        if let Some(window) = app_handle.get_webview_window("main") {
+          let _ = window.show();
+          let _ = window.set_focus();
+          let _ = window.unminimize();
+        }
+      },
+    ))
     .plugin(tauri_plugin_deep_link::init())
     .plugin(tauri_plugin_fs::init())
     .plugin(tauri_plugin_opener::init())
@@ -638,10 +805,41 @@ pub fn run() {
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_macos_permissions::init())
     .setup(|app| {
+      // Recover ephemeral dir mappings from RAM-backed storage (tmpfs/ramdisk)
+      ephemeral_dirs::recover_ephemeral_dirs();
+
       // Start the daemon for tray icon
       if let Err(e) = daemon_spawn::ensure_daemon_running() {
         log::warn!("Failed to start daemon: {e}");
       }
+
+      // Register this GUI's PID in daemon state so the daemon can kill us directly
+      daemon_spawn::register_gui_pid();
+
+      // Monitor daemon health - quit GUI if daemon dies
+      tauri::async_runtime::spawn(async move {
+        // Give the daemon time to fully start
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+          interval.tick().await;
+
+          let is_running = tokio::task::spawn_blocking(daemon_spawn::is_daemon_running)
+            .await
+            .unwrap_or(false);
+
+          if !is_running {
+            log::warn!("Daemon is no longer running, quitting GUI immediately");
+            // Use process::exit for immediate termination. Tauri's exit()
+            // triggers a slow graceful shutdown that can take over a minute
+            // waiting for async tasks (sync, version updater, etc.) to finish.
+            std::process::exit(0);
+          }
+        }
+      });
 
       // Create the main window programmatically
       #[allow(unused_variables)]
@@ -653,6 +851,9 @@ pub fn run() {
         .center()
         .focused(true)
         .visible(true);
+
+      #[cfg(target_os = "windows")]
+      let win_builder = win_builder.decorations(false);
 
       #[allow(unused_variables)]
       let window = win_builder.build().unwrap();
@@ -1070,6 +1271,12 @@ pub fn run() {
               {
                 log::warn!("Failed to check for missing profiles: {}", e);
               }
+              if let Err(e) = engine
+                .check_for_missing_synced_entities(&app_handle_sync)
+                .await
+              {
+                log::warn!("Failed to check for missing entities: {}", e);
+              }
             }
             Err(e) => {
               log::debug!("Sync not configured, skipping missing profile check: {}", e);
@@ -1082,6 +1289,21 @@ pub fn run() {
             .await;
           log::info!("Sync scheduler started");
         }
+      });
+
+      // Start cloud auth background refresh loop
+      let app_handle_cloud = app.handle().clone();
+      tauri::async_runtime::spawn(async move {
+        // On startup, refresh sync token and proxy if cloud auth is active.
+        // api_call_with_retry handles 401/refresh internally — no direct
+        // refresh_access_token call needed.
+        if cloud_auth::CLOUD_AUTH.is_logged_in().await {
+          if let Err(e) = cloud_auth::CLOUD_AUTH.get_or_refresh_sync_token().await {
+            log::warn!("Failed to refresh cloud sync token on startup: {e}");
+          }
+          cloud_auth::CLOUD_AUTH.sync_cloud_proxy().await;
+        }
+        cloud_auth::CloudAuthManager::start_sync_token_refresh_loop(app_handle_cloud).await;
       });
 
       Ok(())
@@ -1104,6 +1326,7 @@ pub fn run() {
       get_all_tags,
       get_browser_release_types,
       update_profile_proxy,
+      update_profile_vpn,
       update_profile_tags,
       update_profile_note,
       check_browser_status,
@@ -1117,6 +1340,8 @@ pub fn run() {
       get_table_sorting_settings,
       save_table_sorting_settings,
       get_system_language,
+      dismiss_window_resize_warning,
+      get_window_resize_warning_dismissed,
       clear_all_version_cache_and_refetch,
       is_default_browser,
       open_url_with_profile,
@@ -1135,6 +1360,7 @@ pub fn run() {
       check_missing_binaries,
       check_missing_geoip_database,
       ensure_all_binaries_exist,
+      ensure_active_browsers_downloaded,
       create_stored_proxy,
       get_stored_proxies,
       update_stored_proxy,
@@ -1164,14 +1390,23 @@ pub fn run() {
       get_traffic_stats_for_period,
       get_sync_settings,
       save_sync_settings,
-      set_profile_sync_enabled,
+      set_profile_sync_mode,
       request_profile_sync,
       set_proxy_sync_enabled,
       set_group_sync_enabled,
       is_proxy_in_use_by_synced_profile,
       is_group_in_use_by_synced_profile,
+      set_vpn_sync_enabled,
+      is_vpn_in_use_by_synced_profile,
+      get_unsynced_entity_counts,
+      enable_sync_for_all_entities,
+      set_e2e_password,
+      check_has_e2e_password,
+      delete_e2e_password,
       read_profile_cookies,
       copy_profile_cookies,
+      import_cookies_from_file,
+      export_profile_cookies,
       check_wayfern_terms_accepted,
       check_wayfern_downloaded,
       accept_wayfern_terms,
@@ -1187,13 +1422,38 @@ pub fn run() {
       list_vpn_configs,
       get_vpn_config,
       delete_vpn_config,
+      create_vpn_config_manual,
+      update_vpn_config,
+      check_vpn_validity,
       connect_vpn,
       disconnect_vpn,
       get_vpn_status,
-      list_active_vpn_connections
+      list_active_vpn_connections,
+      // Cloud auth commands
+      cloud_auth::cloud_request_otp,
+      cloud_auth::cloud_verify_otp,
+      cloud_auth::cloud_get_user,
+      cloud_auth::cloud_refresh_profile,
+      cloud_auth::cloud_logout,
+      cloud_auth::cloud_get_proxy_usage,
+      cloud_auth::cloud_get_countries,
+      cloud_auth::cloud_get_states,
+      cloud_auth::cloud_get_cities,
+      cloud_auth::create_cloud_location_proxy,
+      cloud_auth::restart_sync_service
     ])
-    .run(tauri::generate_context!())
-    .expect("error while running tauri application");
+    .build(tauri::generate_context!())
+    .expect("error while building tauri application")
+    .run(|_app_handle, _event| {
+      #[cfg(target_os = "macos")]
+      if let tauri::RunEvent::Reopen { .. } = _event {
+        if let Some(window) = _app_handle.get_webview_window("main") {
+          let _ = window.show();
+          let _ = window.set_focus();
+          let _ = window.unminimize();
+        }
+      }
+    });
 }
 
 #[cfg(test)]
@@ -1214,13 +1474,12 @@ mod tests {
     // Commands that are intentionally not used in the frontend
     // but are used via MCP server or other programmatic APIs
     let mcp_only_commands = [
-      "list_vpn_configs",
-      "get_vpn_config",
-      "delete_vpn_config",
       "connect_vpn",
       "disconnect_vpn",
       "get_vpn_status",
+      "get_vpn_config",
       "list_active_vpn_connections",
+      "export_profile_cookies",
     ];
 
     // Extract command names from the generate_handler! macro in this file
@@ -1340,6 +1599,8 @@ mod tests {
             // Remove trailing comma and whitespace
             let command = line.trim_end_matches(',').trim();
             if !command.is_empty() {
+              // Strip module prefix (e.g., "cloud_auth::cloud_request_otp" -> "cloud_request_otp")
+              let command = command.rsplit("::").next().unwrap_or(command);
               commands.push(command.to_string());
             }
           }

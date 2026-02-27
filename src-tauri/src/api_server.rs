@@ -601,9 +601,11 @@ async fn create_profile(
       &request.version,
       request.release_type.as_deref().unwrap_or("stable"),
       request.proxy_id.clone(),
+      None, // vpn_id
       camoufox_config,
       wayfern_config,
       request.group_id.clone(),
+      false,
     )
     .await
   {
@@ -1161,6 +1163,7 @@ async fn delete_proxy(
   request_body = RunProfileRequest,
   responses(
     (status = 200, description = "Profile launched successfully", body = RunProfileResponse),
+    (status = 400, description = "Cannot launch cross-OS profile"),
     (status = 401, description = "Unauthorized"),
     (status = 404, description = "Profile not found"),
     (status = 500, description = "Internal server error")
@@ -1187,6 +1190,10 @@ async fn run_profile(
     .iter()
     .find(|p| p.id.to_string() == id)
     .ok_or(StatusCode::NOT_FOUND)?;
+
+  if profile.is_cross_os() {
+    return Err(StatusCode::BAD_REQUEST);
+  }
 
   // Generate a random port for remote debugging
   let remote_debugging_port = rand::random::<u16>().saturating_add(9000).max(9000);

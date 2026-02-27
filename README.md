@@ -25,11 +25,7 @@
   </a>
 </p>
 
-<picture>
- <source media="(prefers-color-scheme: dark)" srcset="assets/preview-dark.png" />
- <source media="(prefers-color-scheme: light)" srcset="assets/preview.png" />
- <img alt="Preview" src="assets/preview.png" />
-</picture>
+<img alt="Donut Browser Preview" src="assets/donut-preview.png" />
 
 ## Features
 
@@ -42,7 +38,6 @@
 
 ## Download
 
-> As of right now, the app is not signed by Apple. You need to have Gatekeeper disabled to run it. The app automatically checks for updates on each launch.
 > For Linux, .deb and .rpm packages are available as well as standalone .AppImage files.
 
 The app can be downloaded from the [releases page](https://github.com/zhom/donutbrowser/releases/latest).
@@ -125,7 +120,7 @@ Have questions or want to contribute? We'd love to hear from you!
 
 ## Contact
 
-Have an urgent question or want to report a security vulnerability? Send an email to contact at donutbrowser dot com and we'll get back to you as fast as possible.
+Have an urgent question or want to report a security vulnerability? Send an email to [contact@donutbrowser.com](mailto:contact@donutbrowser.com) and we'll get back to you as fast as possible.
 
 ## License
 

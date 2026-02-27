@@ -2,7 +2,6 @@ use super::engine::SyncEngine;
 use super::subscription::SyncWorkItem;
 use crate::events;
 use crate::profile::ProfileManager;
-use once_cell::sync::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -11,14 +10,16 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-static GLOBAL_SCHEDULER: OnceCell<Arc<SyncScheduler>> = OnceCell::new();
+static GLOBAL_SCHEDULER: std::sync::Mutex<Option<Arc<SyncScheduler>>> = std::sync::Mutex::new(None);
 
 pub fn get_global_scheduler() -> Option<Arc<SyncScheduler>> {
-  GLOBAL_SCHEDULER.get().cloned()
+  GLOBAL_SCHEDULER.lock().ok().and_then(|g| g.clone())
 }
 
 pub fn set_global_scheduler(scheduler: Arc<SyncScheduler>) {
-  let _ = GLOBAL_SCHEDULER.set(scheduler);
+  if let Ok(mut g) = GLOBAL_SCHEDULER.lock() {
+    *g = Some(scheduler);
+  }
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,7 @@ pub struct SyncScheduler {
   pending_profiles: Arc<Mutex<HashMap<String, ProfileStopTime>>>,
   pending_proxies: Arc<Mutex<HashSet<String>>>,
   pending_groups: Arc<Mutex<HashSet<String>>>,
+  pending_vpns: Arc<Mutex<HashSet<String>>>,
   pending_tombstones: Arc<Mutex<Vec<(String, String)>>>,
   running_profiles: Arc<Mutex<HashSet<String>>>,
   in_flight_profiles: Arc<Mutex<HashSet<String>>>,
@@ -51,6 +53,7 @@ impl SyncScheduler {
       pending_profiles: Arc::new(Mutex::new(HashMap::new())),
       pending_proxies: Arc::new(Mutex::new(HashSet::new())),
       pending_groups: Arc::new(Mutex::new(HashSet::new())),
+      pending_vpns: Arc::new(Mutex::new(HashSet::new())),
       pending_tombstones: Arc::new(Mutex::new(Vec::new())),
       running_profiles: Arc::new(Mutex::new(HashSet::new())),
       in_flight_profiles: Arc::new(Mutex::new(HashSet::new())),
@@ -90,6 +93,12 @@ impl SyncScheduler {
       return true;
     }
     drop(pending_groups);
+
+    let pending_vpns = self.pending_vpns.lock().await;
+    if !pending_vpns.is_empty() {
+      return true;
+    }
+    drop(pending_vpns);
 
     let pending_tombstones = self.pending_tombstones.lock().await;
     if !pending_tombstones.is_empty() {
@@ -189,6 +198,11 @@ impl SyncScheduler {
     pending.insert(proxy_id);
   }
 
+  pub async fn queue_vpn_sync(&self, vpn_id: String) {
+    let mut pending = self.pending_vpns.lock().await;
+    pending.insert(vpn_id);
+  }
+
   pub async fn queue_group_sync(&self, group_id: String) {
     let mut pending = self.pending_groups.lock().await;
     pending.insert(group_id);
@@ -218,7 +232,10 @@ impl SyncScheduler {
       }
     };
 
-    let sync_enabled_profiles: Vec<_> = profiles.into_iter().filter(|p| p.sync_enabled).collect();
+    let sync_enabled_profiles: Vec<_> = profiles
+      .into_iter()
+      .filter(|p| p.is_sync_enabled())
+      .collect();
 
     if sync_enabled_profiles.is_empty() {
       log::debug!("No sync-enabled profiles found");
@@ -268,6 +285,7 @@ impl SyncScheduler {
               SyncWorkItem::Profile(id) => scheduler.queue_profile_sync(id).await,
               SyncWorkItem::Proxy(id) => scheduler.queue_proxy_sync(id).await,
               SyncWorkItem::Group(id) => scheduler.queue_group_sync(id).await,
+              SyncWorkItem::Vpn(id) => scheduler.queue_vpn_sync(id).await,
               SyncWorkItem::Tombstone(entity_type, entity_id) => {
                 scheduler.queue_tombstone(entity_type, entity_id).await
               }
@@ -287,6 +305,7 @@ impl SyncScheduler {
     self.process_pending_profiles(app_handle).await;
     self.process_pending_proxies(app_handle).await;
     self.process_pending_groups(app_handle).await;
+    self.process_pending_vpns(app_handle).await;
     self.process_pending_tombstones(app_handle).await;
   }
 
@@ -337,7 +356,7 @@ impl SyncScheduler {
         profile_manager.list_profiles().ok().and_then(|profiles| {
           profiles
             .into_iter()
-            .find(|p| p.id.to_string() == profile_id && p.sync_enabled)
+            .find(|p| p.id.to_string() == profile_id && p.is_sync_enabled())
         })
       };
 
@@ -365,6 +384,7 @@ impl SyncScheduler {
           && self.pending_profiles.lock().await.is_empty()
           && self.pending_proxies.lock().await.is_empty()
           && self.pending_groups.lock().await.is_empty()
+          && self.pending_vpns.lock().await.is_empty()
       };
 
       match result {
@@ -536,7 +556,69 @@ impl SyncScheduler {
     }
   }
 
-  async fn process_pending_tombstones(&self, app_handle: &tauri::AppHandle) {
+  async fn process_pending_vpns(&self, app_handle: &tauri::AppHandle) {
+    let vpns_to_sync: Vec<String> = {
+      let mut pending = self.pending_vpns.lock().await;
+      let list: Vec<String> = pending.drain().collect();
+      list
+    };
+
+    if vpns_to_sync.is_empty() {
+      return;
+    }
+
+    match SyncEngine::create_from_settings(app_handle).await {
+      Ok(engine) => {
+        for vpn_id in vpns_to_sync {
+          log::info!("Syncing VPN {}", vpn_id);
+          let _ = events::emit(
+            "vpn-sync-status",
+            serde_json::json!({
+              "id": vpn_id,
+              "status": "syncing"
+            }),
+          );
+          match engine.sync_vpn_by_id_with_handle(&vpn_id, app_handle).await {
+            Ok(()) => {
+              let _ = events::emit(
+                "vpn-sync-status",
+                serde_json::json!({
+                  "id": vpn_id,
+                  "status": "synced"
+                }),
+              );
+            }
+            Err(e) => {
+              log::error!("Failed to sync VPN {}: {}", vpn_id, e);
+              let _ = events::emit(
+                "vpn-sync-status",
+                serde_json::json!({
+                  "id": vpn_id,
+                  "status": "error"
+                }),
+              );
+            }
+          }
+        }
+
+        if !self.is_sync_in_progress().await {
+          log::debug!("All syncs completed after VPN sync, triggering cleanup");
+          let registry =
+            crate::downloaded_browsers_registry::DownloadedBrowsersRegistry::instance();
+          if let Err(e) = registry.cleanup_unused_binaries() {
+            log::warn!("Cleanup after sync failed: {e}");
+          } else {
+            log::debug!("Cleanup after sync completed successfully");
+          }
+        }
+      }
+      Err(e) => {
+        log::error!("Failed to create sync engine: {}", e);
+      }
+    }
+  }
+
+  async fn process_pending_tombstones(&self, _app_handle: &tauri::AppHandle) {
     let tombstones: Vec<(String, String)> = {
       let mut pending = self.pending_tombstones.lock().await;
       std::mem::take(&mut *pending)
@@ -550,61 +632,68 @@ impl SyncScheduler {
       log::info!("Processing tombstone for {} {}", entity_type, entity_id);
       match entity_type.as_str() {
         "profile" => {
-          let exists_locally = {
-            let profile_manager = ProfileManager::instance();
+          let profile_manager = ProfileManager::instance();
+          let profile_to_delete = {
             if let Ok(profiles) = profile_manager.list_profiles() {
               let profile_uuid = uuid::Uuid::parse_str(&entity_id).ok();
-              profile_uuid
-                .as_ref()
-                .map(|uuid| profiles.iter().any(|p| p.id == *uuid))
-                .unwrap_or(false)
+              profile_uuid.and_then(|uuid| profiles.into_iter().find(|p| p.id == uuid))
             } else {
-              false
+              None
             }
           };
 
-          if exists_locally {
-            // Profile exists locally but was deleted remotely - delete locally
+          if let Some(mut profile) = profile_to_delete {
             log::info!(
-              "Profile {} exists locally, deleting due to remote tombstone",
+              "Profile {} was deleted remotely, disabling sync locally",
               entity_id
             );
-            // Note: We don't actually delete here to avoid data loss.
-            // The user should be notified or we could add a confirmation step.
-            // For now, just log it.
-          } else {
-            // Profile doesn't exist locally - check if it still exists remotely
-            // (tombstone might have been created but profile files still exist)
-            // Try to download it
-            match SyncEngine::create_from_settings(app_handle).await {
-              Ok(engine) => {
-                if let Ok(true) = engine
-                  .download_profile_if_missing(app_handle, &entity_id)
-                  .await
-                {
-                  log::info!(
-                    "Downloaded missing profile {} from remote storage",
-                    entity_id
-                  );
-                }
-              }
-              Err(e) => {
-                log::debug!("Sync not configured, skipping profile download: {}", e);
-              }
+            profile.sync_mode = crate::profile::types::SyncMode::Disabled;
+            if let Err(e) = profile_manager.save_profile(&profile) {
+              log::warn!("Failed to disable sync for profile {}: {}", entity_id, e);
+            } else {
+              log::info!(
+                "Profile {} sync disabled due to remote tombstone (local copy kept)",
+                entity_id
+              );
+              let _ = events::emit("profiles-changed", ());
             }
           }
         }
         "proxy" => {
-          log::debug!(
-            "Proxy tombstone for {} - local deletion not implemented",
-            entity_id
-          );
+          let proxy_manager = &crate::proxy_manager::PROXY_MANAGER;
+          let proxies = proxy_manager.get_stored_proxies();
+          if let Some(proxy) = proxies.iter().find(|p| p.id == entity_id) {
+            if proxy.sync_enabled {
+              log::info!("Proxy {} was deleted remotely, deleting locally", entity_id);
+              let proxy_file = proxy_manager.get_proxy_file_path(&entity_id);
+              if proxy_file.exists() {
+                let _ = std::fs::remove_file(&proxy_file);
+              }
+              proxy_manager.remove_from_memory(&entity_id);
+              let _ = events::emit("stored-proxies-changed", ());
+            }
+          }
         }
         "group" => {
-          log::debug!(
-            "Group tombstone for {} - local deletion not implemented",
-            entity_id
-          );
+          let group_manager = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+          let groups = group_manager.get_all_groups().unwrap_or_default();
+          if let Some(group) = groups.iter().find(|g| g.id == entity_id) {
+            if group.sync_enabled {
+              log::info!("Group {} was deleted remotely, deleting locally", entity_id);
+              let _ = group_manager.delete_group_internal(&entity_id);
+              let _ = events::emit("groups-changed", ());
+            }
+          }
+        }
+        "vpn" => {
+          let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+          if let Ok(vpn) = storage.load_config(&entity_id) {
+            if vpn.sync_enabled {
+              log::info!("VPN {} was deleted remotely, deleting locally", entity_id);
+              let _ = storage.delete_config(&entity_id);
+              let _ = events::emit("vpn-configs-changed", ());
+            }
+          }
         }
         _ => {}
       }

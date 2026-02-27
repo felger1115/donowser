@@ -3,7 +3,12 @@
  * Centralized helpers for browser name mapping, icons, etc.
  */
 
-import { FaChrome, FaExclamationTriangle, FaFirefox } from "react-icons/fa";
+import {
+  FaChrome,
+  FaExclamationTriangle,
+  FaFire,
+  FaFirefox,
+} from "react-icons/fa";
 
 /**
  * Map internal browser names to display names
@@ -15,8 +20,8 @@ export function getBrowserDisplayName(browserType: string): string {
     zen: "Zen Browser",
     brave: "Brave",
     chromium: "Chromium",
-    camoufox: "Firefox (Camoufox)",
-    wayfern: "Chromium (Wayfern)",
+    camoufox: "Camoufox",
+    wayfern: "Wayfern",
   };
 
   return browserNames[browserType] || browserType;
@@ -39,6 +44,14 @@ export function getBrowserIcon(browserType: string) {
   }
 }
 
+export function getProfileIcon(profile: {
+  browser: string;
+  ephemeral?: boolean;
+}) {
+  if (profile.ephemeral) return FaFire;
+  return getBrowserIcon(profile.browser);
+}
+
 export const getCurrentOS = () => {
   if (typeof window !== "undefined") {
     const userAgent = window.navigator.userAgent;
@@ -48,3 +61,21 @@ export const getCurrentOS = () => {
   }
   return "unknown";
 };
+
+export function isCrossOsProfile(profile: { host_os?: string }): boolean {
+  if (!profile.host_os) return false;
+  return profile.host_os !== getCurrentOS();
+}
+
+export function getOSDisplayName(os: string): string {
+  switch (os) {
+    case "macos":
+      return "macOS";
+    case "windows":
+      return "Windows";
+    case "linux":
+      return "Linux";
+    default:
+      return os;
+  }
+}

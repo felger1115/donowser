@@ -2,11 +2,13 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { GoPlus } from "react-icons/go";
 import { LoadingButton } from "@/components/loading-button";
 import { ProxyFormDialog } from "@/components/proxy-form-dialog";
 import { SharedCamoufoxConfigForm } from "@/components/shared-camoufox-config-form";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -20,15 +22,17 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { WayfernConfigForm } from "@/components/wayfern-config-form";
-
 import { useBrowserDownload } from "@/hooks/use-browser-download";
 import { useProxyEvents } from "@/hooks/use-proxy-events";
+import { useVpnEvents } from "@/hooks/use-vpn-events";
 import { getBrowserIcon } from "@/lib/browser-utils";
 import type {
   BrowserReleaseTypes,
@@ -66,11 +70,14 @@ interface CreateProfileDialogProps {
     version: string;
     releaseType: string;
     proxyId?: string;
+    vpnId?: string;
     camoufoxConfig?: CamoufoxConfig;
     wayfernConfig?: WayfernConfig;
     groupId?: string;
+    ephemeral?: boolean;
   }) => Promise<void>;
   selectedGroupId?: string;
+  crossOsUnlocked?: boolean;
 }
 
 interface BrowserOption {
@@ -106,7 +113,9 @@ export function CreateProfileDialog({
   onClose,
   onCreateProfile,
   selectedGroupId,
+  crossOsUnlocked = false,
 }: CreateProfileDialogProps) {
+  const { t } = useTranslation();
   const [profileName, setProfileName] = useState("");
   const [currentStep, setCurrentStep] = useState<
     "browser-selection" | "browser-config"
@@ -153,8 +162,10 @@ export function CreateProfileDialog({
 
   const [supportedBrowsers, setSupportedBrowsers] = useState<string[]>([]);
   const { storedProxies } = useProxyEvents();
+  const { vpnConfigs } = useVpnEvents();
   const [showProxyForm, setShowProxyForm] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
+  const [ephemeral, setEphemeral] = useState(false);
   const [releaseTypes, setReleaseTypes] = useState<BrowserReleaseTypes>();
   const [isLoadingReleaseTypes, setIsLoadingReleaseTypes] = useState(false);
   const [releaseTypesError, setReleaseTypesError] = useState<string | null>(
@@ -168,6 +179,7 @@ export function CreateProfileDialog({
     downloadBrowser,
     loadDownloadedVersions,
     isVersionDownloaded,
+    downloadedVersions,
   } = useBrowserDownload();
 
   const loadSupportedBrowsers = useCallback(async () => {
@@ -326,6 +338,26 @@ export function CreateProfileDialog({
     [releaseTypes],
   );
 
+  const getCreatableVersion = useCallback(
+    (browserType?: string) => {
+      const bestVersion = getBestAvailableVersion(browserType);
+      if (bestVersion && isVersionDownloaded(bestVersion.version)) {
+        return bestVersion;
+      }
+      if (downloadedVersions.length > 0) {
+        const fallbackVersion = downloadedVersions[0];
+        const releaseType =
+          browserType === "firefox-developer" ? "nightly" : "stable";
+        return {
+          version: fallbackVersion,
+          releaseType: releaseType as "stable" | "nightly",
+        };
+      }
+      return null;
+    },
+    [getBestAvailableVersion, isVersionDownloaded, downloadedVersions],
+  );
+
   const handleDownload = async (browserStr: string) => {
     const bestVersion = getBestAvailableVersion(browserStr);
 
@@ -345,11 +377,16 @@ export function CreateProfileDialog({
     if (!profileName.trim()) return;
 
     setIsCreating(true);
+
+    const isVpnSelection = selectedProxyId?.startsWith("vpn-") ?? false;
+    const resolvedProxyId = isVpnSelection ? undefined : selectedProxyId;
+    const resolvedVpnId =
+      isVpnSelection && selectedProxyId ? selectedProxyId.slice(4) : undefined;
     try {
       if (activeTab === "anti-detect") {
         // Anti-detect browser - check if Wayfern or Camoufox is selected
         if (selectedBrowser === "wayfern") {
-          const bestWayfernVersion = getBestAvailableVersion("wayfern");
+          const bestWayfernVersion = getCreatableVersion("wayfern");
           if (!bestWayfernVersion) {
             console.error("No Wayfern version available");
             return;
@@ -363,14 +400,16 @@ export function CreateProfileDialog({
             browserStr: "wayfern" as BrowserTypeString,
             version: bestWayfernVersion.version,
             releaseType: bestWayfernVersion.releaseType,
-            proxyId: selectedProxyId,
+            proxyId: resolvedProxyId,
+            vpnId: resolvedVpnId,
             wayfernConfig: finalWayfernConfig,
             groupId:
               selectedGroupId !== "default" ? selectedGroupId : undefined,
+            ephemeral,
           });
         } else {
           // Default to Camoufox
-          const bestCamoufoxVersion = getBestAvailableVersion("camoufox");
+          const bestCamoufoxVersion = getCreatableVersion("camoufox");
           if (!bestCamoufoxVersion) {
             console.error("No Camoufox version available");
             return;
@@ -385,10 +424,12 @@ export function CreateProfileDialog({
             browserStr: "camoufox" as BrowserTypeString,
             version: bestCamoufoxVersion.version,
             releaseType: bestCamoufoxVersion.releaseType,
-            proxyId: selectedProxyId,
+            proxyId: resolvedProxyId,
+            vpnId: resolvedVpnId,
             camoufoxConfig: finalCamoufoxConfig,
             groupId:
               selectedGroupId !== "default" ? selectedGroupId : undefined,
+            ephemeral,
           });
         }
       } else {
@@ -399,7 +440,7 @@ export function CreateProfileDialog({
         }
 
         // Use the best available version (stable preferred, nightly as fallback)
-        const bestVersion = getBestAvailableVersion(selectedBrowser);
+        const bestVersion = getCreatableVersion(selectedBrowser);
         if (!bestVersion) {
           console.error("No version available");
           return;
@@ -443,6 +484,7 @@ export function CreateProfileDialog({
     setWayfernConfig({
       os: getCurrentOS() as WayfernOS, // Reset to current OS
     });
+    setEphemeral(false);
     onClose();
   };
 
@@ -475,14 +517,14 @@ export function CreateProfileDialog({
     if (!profileName.trim()) return true;
     if (!selectedBrowser) return true;
     if (isBrowserCurrentlyDownloading(selectedBrowser)) return true;
-    if (!isBrowserVersionAvailable(selectedBrowser)) return true;
+    if (!getCreatableVersion(selectedBrowser)) return true;
 
     return false;
   }, [
     profileName,
     selectedBrowser,
     isBrowserCurrentlyDownloading,
-    isBrowserVersionAvailable,
+    getCreatableVersion,
   ]);
 
   // Filter supported browsers for regular browsers
@@ -541,9 +583,7 @@ export function CreateProfileDialog({
                               })()}
                             </div>
                             <div className="text-left">
-                              <div className="font-medium">
-                                Chromium (Wayfern)
-                              </div>
+                              <div className="font-medium">Wayfern</div>
                               <div className="text-sm text-muted-foreground">
                                 Anti-Detect Browser
                               </div>
@@ -566,9 +606,7 @@ export function CreateProfileDialog({
                               })()}
                             </div>
                             <div className="text-left">
-                              <div className="font-medium">
-                                Firefox (Camoufox)
-                              </div>
+                              <div className="font-medium">Camoufox</div>
                               <div className="text-sm text-muted-foreground">
                                 Anti-Detect Browser
                               </div>
@@ -648,6 +686,28 @@ export function CreateProfileDialog({
                           />
                         </div>
 
+                        {/* Ephemeral Option */}
+                        <div className="space-y-3 p-4 border rounded-lg bg-muted/30">
+                          <div className="flex items-center space-x-2">
+                            <Checkbox
+                              id="ephemeral"
+                              checked={ephemeral}
+                              onCheckedChange={(checked) =>
+                                setEphemeral(checked === true)
+                              }
+                            />
+                            <Label htmlFor="ephemeral" className="font-medium">
+                              {t("profiles.ephemeral")}
+                            </Label>
+                            <span className="px-1 py-0.5 text-[10px] leading-none rounded bg-muted text-muted-foreground font-medium">
+                              {t("profiles.ephemeralAlpha")}
+                            </span>
+                          </div>
+                          <p className="text-sm text-muted-foreground ml-6">
+                            {t("profiles.ephemeralDescription")}
+                          </p>
+                        </div>
+
                         {selectedBrowser === "wayfern" ? (
                           // Wayfern Configuration
                           <div className="space-y-6">
@@ -677,6 +737,16 @@ export function CreateProfileDialog({
                                 </RippleButton>
                               </div>
                             )}
+                            {!isLoadingReleaseTypes &&
+                              !releaseTypesError &&
+                              !getBestAvailableVersion("wayfern") && (
+                                <div className="flex gap-3 items-center p-3 rounded-md border border-yellow-500/50 bg-yellow-500/10">
+                                  <p className="text-sm text-yellow-500">
+                                    Wayfern is not available on your platform
+                                    yet.
+                                  </p>
+                                </div>
+                              )}
                             {!isLoadingReleaseTypes &&
                               !releaseTypesError &&
                               !isBrowserCurrentlyDownloading("wayfern") &&
@@ -732,6 +802,8 @@ export function CreateProfileDialog({
                               config={wayfernConfig}
                               onConfigChange={updateWayfernConfig}
                               isCreating
+                              crossOsUnlocked={crossOsUnlocked}
+                              limitedMode={!crossOsUnlocked}
                             />
                           </div>
                         ) : selectedBrowser === "camoufox" ? (
@@ -763,6 +835,16 @@ export function CreateProfileDialog({
                                 </RippleButton>
                               </div>
                             )}
+                            {!isLoadingReleaseTypes &&
+                              !releaseTypesError &&
+                              !getBestAvailableVersion("camoufox") && (
+                                <div className="flex gap-3 items-center p-3 rounded-md border border-yellow-500/50 bg-yellow-500/10">
+                                  <p className="text-sm text-yellow-500">
+                                    Camoufox is not available on your platform
+                                    yet.
+                                  </p>
+                                </div>
+                              )}
                             {!isLoadingReleaseTypes &&
                               !releaseTypesError &&
                               !isBrowserCurrentlyDownloading("camoufox") &&
@@ -819,6 +901,8 @@ export function CreateProfileDialog({
                               onConfigChange={updateCamoufoxConfig}
                               isCreating
                               browserType="camoufox"
+                              crossOsUnlocked={crossOsUnlocked}
+                              limitedMode={!crossOsUnlocked}
                             />
                           </div>
                         ) : (
@@ -922,10 +1006,10 @@ export function CreateProfileDialog({
                           </div>
                         )}
 
-                        {/* Proxy Selection - Always visible */}
+                        {/* Proxy / VPN Selection - Always visible */}
                         <div className="space-y-3">
                           <div className="flex justify-between items-center">
-                            <Label>Proxy</Label>
+                            <Label>Proxy / VPN</Label>
                             <RippleButton
                               size="sm"
                               variant="outline"
@@ -935,7 +1019,7 @@ export function CreateProfileDialog({
                               <GoPlus className="mr-1 w-3 h-3" /> Add Proxy
                             </RippleButton>
                           </div>
-                          {storedProxies.length > 0 ? (
+                          {storedProxies.length > 0 || vpnConfigs.length > 0 ? (
                             <Select
                               value={selectedProxyId || "none"}
                               onValueChange={(value) =>
@@ -945,21 +1029,47 @@ export function CreateProfileDialog({
                               }
                             >
                               <SelectTrigger>
-                                <SelectValue placeholder="No proxy" />
+                                <SelectValue placeholder="No proxy / VPN" />
                               </SelectTrigger>
                               <SelectContent>
-                                <SelectItem value="none">No proxy</SelectItem>
-                                {storedProxies.map((proxy) => (
-                                  <SelectItem key={proxy.id} value={proxy.id}>
-                                    {proxy.name}
-                                  </SelectItem>
-                                ))}
+                                <SelectItem value="none">
+                                  No proxy / VPN
+                                </SelectItem>
+                                {storedProxies.length > 0 && (
+                                  <SelectGroup>
+                                    <SelectLabel>Proxies</SelectLabel>
+                                    {storedProxies.map((proxy) => (
+                                      <SelectItem
+                                        key={proxy.id}
+                                        value={proxy.id}
+                                      >
+                                        {proxy.name}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectGroup>
+                                )}
+                                {vpnConfigs.length > 0 && (
+                                  <SelectGroup>
+                                    <SelectLabel>VPNs</SelectLabel>
+                                    {vpnConfigs.map((vpn) => (
+                                      <SelectItem
+                                        key={vpn.id}
+                                        value={`vpn-${vpn.id}`}
+                                      >
+                                        {vpn.vpn_type === "WireGuard"
+                                          ? "WG"
+                                          : "OVPN"}{" "}
+                                        — {vpn.name}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectGroup>
+                                )}
                               </SelectContent>
                             </Select>
                           ) : (
                             <div className="flex gap-3 items-center p-3 text-sm rounded-md border text-muted-foreground">
-                              No proxies available. Add one to route this
-                              profile's traffic.
+                              No proxies or VPNs available. Add one to route
+                              this profile's traffic.
                             </div>
                           )}
                         </div>
@@ -1083,10 +1193,10 @@ export function CreateProfileDialog({
                           )}
                         </div>
 
-                        {/* Proxy Selection - Always visible */}
+                        {/* Proxy / VPN Selection - Always visible */}
                         <div className="space-y-3">
                           <div className="flex justify-between items-center">
-                            <Label>Proxy</Label>
+                            <Label>Proxy / VPN</Label>
                             <RippleButton
                               size="sm"
                               variant="outline"
@@ -1096,7 +1206,7 @@ export function CreateProfileDialog({
                               <GoPlus className="mr-1 w-3 h-3" /> Add Proxy
                             </RippleButton>
                           </div>
-                          {storedProxies.length > 0 ? (
+                          {storedProxies.length > 0 || vpnConfigs.length > 0 ? (
                             <Select
                               value={selectedProxyId || "none"}
                               onValueChange={(value) =>
@@ -1106,21 +1216,47 @@ export function CreateProfileDialog({
                               }
                             >
                               <SelectTrigger>
-                                <SelectValue placeholder="No proxy" />
+                                <SelectValue placeholder="No proxy / VPN" />
                               </SelectTrigger>
                               <SelectContent>
-                                <SelectItem value="none">No proxy</SelectItem>
-                                {storedProxies.map((proxy) => (
-                                  <SelectItem key={proxy.id} value={proxy.id}>
-                                    {proxy.name}
-                                  </SelectItem>
-                                ))}
+                                <SelectItem value="none">
+                                  No proxy / VPN
+                                </SelectItem>
+                                {storedProxies.length > 0 && (
+                                  <SelectGroup>
+                                    <SelectLabel>Proxies</SelectLabel>
+                                    {storedProxies.map((proxy) => (
+                                      <SelectItem
+                                        key={proxy.id}
+                                        value={proxy.id}
+                                      >
+                                        {proxy.name}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectGroup>
+                                )}
+                                {vpnConfigs.length > 0 && (
+                                  <SelectGroup>
+                                    <SelectLabel>VPNs</SelectLabel>
+                                    {vpnConfigs.map((vpn) => (
+                                      <SelectItem
+                                        key={vpn.id}
+                                        value={`vpn-${vpn.id}`}
+                                      >
+                                        {vpn.vpn_type === "WireGuard"
+                                          ? "WG"
+                                          : "OVPN"}{" "}
+                                        — {vpn.name}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectGroup>
+                                )}
                               </SelectContent>
                             </Select>
                           ) : (
                             <div className="flex gap-3 items-center p-3 text-sm rounded-md border text-muted-foreground">
-                              No proxies available. Add one to route this
-                              profile's traffic.
+                              No proxies or VPNs available. Add one to route
+                              this profile's traffic.
                             </div>
                           )}
                         </div>

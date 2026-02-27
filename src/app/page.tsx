@@ -3,10 +3,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrent } from "@tauri-apps/plugin-deep-link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CamoufoxConfigDialog } from "@/components/camoufox-config-dialog";
 import { CommercialTrialModal } from "@/components/commercial-trial-modal";
 import { CookieCopyDialog } from "@/components/cookie-copy-dialog";
+import { CookieManagementDialog } from "@/components/cookie-management-dialog";
 import { CreateProfileDialog } from "@/components/create-profile-dialog";
 import { DeleteConfirmationDialog } from "@/components/delete-confirmation-dialog";
 import { GroupAssignmentDialog } from "@/components/group-assignment-dialog";
@@ -23,9 +24,12 @@ import { ProfileSyncDialog } from "@/components/profile-sync-dialog";
 import { ProxyAssignmentDialog } from "@/components/proxy-assignment-dialog";
 import { ProxyManagementDialog } from "@/components/proxy-management-dialog";
 import { SettingsDialog } from "@/components/settings-dialog";
+import { SyncAllDialog } from "@/components/sync-all-dialog";
 import { SyncConfigDialog } from "@/components/sync-config-dialog";
 import { WayfernTermsDialog } from "@/components/wayfern-terms-dialog";
+import { WindowResizeWarningDialog } from "@/components/window-resize-warning-dialog";
 import { useAppUpdateNotifications } from "@/hooks/use-app-update-notifications";
+import { useCloudAuth } from "@/hooks/use-cloud-auth";
 import { useCommercialTrial } from "@/hooks/use-commercial-trial";
 import { useGroupEvents } from "@/hooks/use-group-events";
 import type { PermissionType } from "@/hooks/use-permissions";
@@ -34,9 +38,20 @@ import { useProfileEvents } from "@/hooks/use-profile-events";
 import { useProxyEvents } from "@/hooks/use-proxy-events";
 import { useUpdateNotifications } from "@/hooks/use-update-notifications";
 import { useVersionUpdater } from "@/hooks/use-version-updater";
+import { useVpnEvents } from "@/hooks/use-vpn-events";
 import { useWayfernTerms } from "@/hooks/use-wayfern-terms";
-import { showErrorToast, showSuccessToast, showToast } from "@/lib/toast-utils";
-import type { BrowserProfile, CamoufoxConfig, WayfernConfig } from "@/types";
+import {
+  dismissToast,
+  showErrorToast,
+  showSuccessToast,
+  showToast,
+} from "@/lib/toast-utils";
+import type {
+  BrowserProfile,
+  CamoufoxConfig,
+  SyncSettings,
+  WayfernConfig,
+} from "@/types";
 
 type BrowserTypeString =
   | "firefox"
@@ -76,6 +91,8 @@ export default function Home() {
     error: proxiesError,
   } = useProxyEvents();
 
+  const { vpnConfigs } = useVpnEvents();
+
   // Wayfern terms and commercial trial hooks
   const {
     termsAccepted,
@@ -87,6 +104,30 @@ export default function Home() {
     hasAcknowledged: trialAcknowledged,
     checkTrialStatus,
   } = useCommercialTrial();
+
+  // Cloud auth for cross-OS unlock
+  const { user: cloudUser } = useCloudAuth();
+  const crossOsUnlocked =
+    cloudUser?.plan !== "free" &&
+    (cloudUser?.subscriptionStatus === "active" ||
+      cloudUser?.planPeriod === "lifetime");
+
+  const [selfHostedSyncConfigured, setSelfHostedSyncConfigured] =
+    useState(false);
+
+  const checkSelfHostedSync = useCallback(async () => {
+    try {
+      const settings = await invoke<SyncSettings>("get_sync_settings");
+      const hasConfig = Boolean(
+        settings.sync_server_url && settings.sync_token,
+      );
+      setSelfHostedSyncConfigured(hasConfig && !cloudUser);
+    } catch {
+      setSelfHostedSyncConfigured(false);
+    }
+  }, [cloudUser]);
+
+  const syncUnlocked = crossOsUnlocked || selfHostedSyncConfigured;
 
   const [createProfileDialogOpen, setCreateProfileDialogOpen] = useState(false);
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
@@ -103,6 +144,12 @@ export default function Home() {
   const [proxyAssignmentDialogOpen, setProxyAssignmentDialogOpen] =
     useState(false);
   const [cookieCopyDialogOpen, setCookieCopyDialogOpen] = useState(false);
+  const [cookieManagementDialogOpen, setCookieManagementDialogOpen] =
+    useState(false);
+  const [
+    currentProfileForCookieManagement,
+    setCurrentProfileForCookieManagement,
+  ] = useState<BrowserProfile | null>(null);
   const [selectedProfilesForCookies, setSelectedProfilesForCookies] = useState<
     string[]
   >([]);
@@ -120,6 +167,10 @@ export default function Home() {
     useState<BrowserProfile | null>(null);
   const [hasCheckedStartupPrompt, setHasCheckedStartupPrompt] = useState(false);
   const [launchOnLoginDialogOpen, setLaunchOnLoginDialogOpen] = useState(false);
+  const [windowResizeWarningOpen, setWindowResizeWarningOpen] = useState(false);
+  const windowResizeWarningResolver = useRef<
+    ((proceed: boolean) => void) | null
+  >(null);
   const [permissionDialogOpen, setPermissionDialogOpen] = useState(false);
   const [currentPermissionType, setCurrentPermissionType] =
     useState<PermissionType>("microphone");
@@ -127,11 +178,14 @@ export default function Home() {
     useState(false);
   const [isBulkDeleting, setIsBulkDeleting] = useState(false);
   const [syncConfigDialogOpen, setSyncConfigDialogOpen] = useState(false);
+  const [syncAllDialogOpen, setSyncAllDialogOpen] = useState(false);
   const [profileSyncDialogOpen, setProfileSyncDialogOpen] = useState(false);
   const [currentProfileForSync, setCurrentProfileForSync] =
     useState<BrowserProfile | null>(null);
   const { isMicrophoneAccessGranted, isCameraAccessGranted, isInitialized } =
     usePermissions();
+
+  const userInitiatedSyncIds = useRef<Set<string>>(new Set());
 
   const handleSelectGroup = useCallback((groupId: string) => {
     setSelectedGroupId(groupId);
@@ -440,9 +494,11 @@ export default function Home() {
       version: string;
       releaseType: string;
       proxyId?: string;
+      vpnId?: string;
       camoufoxConfig?: CamoufoxConfig;
       wayfernConfig?: WayfernConfig;
       groupId?: string;
+      ephemeral?: boolean;
     }) => {
       try {
         await invoke<BrowserProfile>("create_browser_profile_new", {
@@ -451,11 +507,13 @@ export default function Home() {
           version: profileData.version,
           releaseType: profileData.releaseType,
           proxyId: profileData.proxyId,
+          vpnId: profileData.vpnId,
           camoufoxConfig: profileData.camoufoxConfig,
           wayfernConfig: profileData.wayfernConfig,
           groupId:
             profileData.groupId ||
             (selectedGroupId !== "default" ? selectedGroupId : undefined),
+          ephemeral: profileData.ephemeral,
         });
 
         // No need to manually reload - useProfileEvents will handle the update
@@ -474,6 +532,26 @@ export default function Home() {
   const launchProfile = useCallback(async (profile: BrowserProfile) => {
     console.log("Starting launch for profile:", profile.name);
 
+    // Show one-time warning about window resizing for fingerprinted browsers
+    if (profile.browser === "camoufox" || profile.browser === "wayfern") {
+      try {
+        const dismissed = await invoke<boolean>(
+          "get_window_resize_warning_dismissed",
+        );
+        if (!dismissed) {
+          const proceed = await new Promise<boolean>((resolve) => {
+            windowResizeWarningResolver.current = resolve;
+            setWindowResizeWarningOpen(true);
+          });
+          if (!proceed) {
+            return;
+          }
+        }
+      } catch (error) {
+        console.error("Failed to check window resize warning:", error);
+      }
+    }
+
     try {
       const result = await invoke<BrowserProfile>("launch_browser_profile", {
         profile,
@@ -483,7 +561,6 @@ export default function Home() {
       console.error("Failed to launch browser:", err);
       const errorMessage = err instanceof Error ? err.message : String(err);
       showErrorToast(`Failed to launch browser: ${errorMessage}`);
-      // Re-throw the error so the table component can handle loading state cleanup
       throw err;
     }
   }, []);
@@ -644,6 +721,11 @@ export default function Home() {
     setCookieCopyDialogOpen(true);
   }, []);
 
+  const handleOpenCookieManagement = useCallback((profile: BrowserProfile) => {
+    setCurrentProfileForCookieManagement(profile);
+    setCookieManagementDialogOpen(true);
+  }, []);
+
   const handleGroupAssignmentComplete = useCallback(async () => {
     // No need to manually reload - useProfileEvents will handle the update
     setGroupAssignmentDialogOpen(false);
@@ -668,18 +750,19 @@ export default function Home() {
   const handleToggleProfileSync = useCallback(
     async (profile: BrowserProfile) => {
       try {
-        await invoke("set_profile_sync_enabled", {
+        const enabling = !profile.sync_mode || profile.sync_mode === "Disabled";
+        await invoke("set_profile_sync_mode", {
           profileId: profile.id,
-          enabled: !profile.sync_enabled,
+          syncMode: enabling ? "Regular" : "Disabled",
         });
-        showSuccessToast(
-          profile.sync_enabled ? "Sync disabled" : "Sync enabled",
-          {
-            description: profile.sync_enabled
-              ? "Profile sync has been disabled"
-              : "Profile sync has been enabled",
-          },
-        );
+        if (enabling) {
+          userInitiatedSyncIds.current.add(profile.id);
+        }
+        showSuccessToast(enabling ? "Sync enabled" : "Sync disabled", {
+          description: enabling
+            ? "Profile sync has been enabled"
+            : "Profile sync has been disabled",
+        });
       } catch (error) {
         console.error("Failed to toggle sync:", error);
         showErrorToast("Failed to update sync settings");
@@ -687,6 +770,50 @@ export default function Home() {
     },
     [],
   );
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        unlisten = await listen<{
+          profile_id: string;
+          status: string;
+          error?: string;
+        }>("profile-sync-status", (event) => {
+          const { profile_id, status, error } = event.payload;
+          if (!userInitiatedSyncIds.current.has(profile_id)) return;
+
+          const toastId = `sync-${profile_id}`;
+          const profile = profiles.find((p) => p.id === profile_id);
+          const name = profile?.name ?? "Unknown";
+
+          if (status === "syncing") {
+            showToast({
+              type: "loading",
+              title: `Syncing profile '${name}'...`,
+              id: toastId,
+              duration: 30000,
+            });
+          } else if (status === "synced") {
+            dismissToast(toastId);
+            showSuccessToast(`Profile '${name}' synced successfully`);
+            userInitiatedSyncIds.current.delete(profile_id);
+          } else if (status === "error") {
+            dismissToast(toastId);
+            showErrorToast(
+              `Failed to sync profile '${name}'${error ? `: ${error}` : ""}`,
+            );
+            userInitiatedSyncIds.current.delete(profile_id);
+          }
+        });
+      } catch (error) {
+        console.error("Failed to listen for sync status events:", error);
+      }
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [profiles]);
 
   useEffect(() => {
     // Check for startup default browser prompt
@@ -717,6 +844,13 @@ export default function Home() {
     // Check for missing binaries after initial profile load
     if (!profilesLoading && profiles.length > 0) {
       void checkMissingBinaries();
+    }
+
+    // Proactively download Wayfern and Camoufox if not already available
+    if (!profilesLoading) {
+      void invoke("ensure_active_browsers_downloaded").catch((err: unknown) => {
+        console.error("Failed to auto-download browsers:", err);
+      });
     }
 
     return () => {
@@ -766,7 +900,7 @@ export default function Home() {
     }
   }, [profiles]);
 
-  // Show warning for non-wayfern/camoufox profiles (support ending March 1, 2026)
+  // Show warning for non-wayfern/camoufox profiles (support ending March 15, 2026)
   useEffect(() => {
     if (profiles.length === 0) return;
 
@@ -783,7 +917,7 @@ export default function Home() {
         id: "browser-support-ending-warning",
         type: "error",
         title: "Browser support ending soon",
-        description: `Support for the following profiles will be removed on March 1, 2026: ${unsupportedNames}. Please migrate to Wayfern or Camoufox profiles.`,
+        description: `Support for the following profiles will be removed on March 15, 2026: ${unsupportedNames}. Please migrate to Wayfern or Camoufox profiles.`,
         duration: 15000,
         action: {
           label: "Learn more",
@@ -823,6 +957,11 @@ export default function Home() {
       void checkAllPermissions();
     }
   }, [isInitialized, checkAllPermissions]);
+
+  // Check self-hosted sync config on mount and when cloud user changes
+  useEffect(() => {
+    void checkSelfHostedSync();
+  }, [checkSelfHostedSync]);
 
   // Filter data by selected group and search query
   const filteredProfiles = useMemo(() => {
@@ -893,6 +1032,7 @@ export default function Home() {
             onRenameProfile={handleRenameProfile}
             onConfigureCamoufox={handleConfigureCamoufox}
             onCopyCookiesToProfile={handleCopyCookiesToProfile}
+            onOpenCookieManagement={handleOpenCookieManagement}
             runningProfiles={runningProfiles}
             isUpdating={isUpdating}
             onDeleteSelectedProfiles={handleDeleteSelectedProfiles}
@@ -906,6 +1046,8 @@ export default function Home() {
             onBulkCopyCookies={handleBulkCopyCookies}
             onOpenProfileSyncDialog={handleOpenProfileSyncDialog}
             onToggleProfileSync={handleToggleProfileSync}
+            crossOsUnlocked={crossOsUnlocked}
+            syncUnlocked={syncUnlocked}
           />
         </div>
       </main>
@@ -917,6 +1059,7 @@ export default function Home() {
         }}
         onCreateProfile={handleCreateProfile}
         selectedGroupId={selectedGroupId}
+        crossOsUnlocked={crossOsUnlocked}
       />
 
       <SettingsDialog
@@ -988,6 +1131,7 @@ export default function Home() {
             ? runningProfiles.has(currentProfileForCamoufoxConfig.id)
             : false
         }
+        crossOsUnlocked={crossOsUnlocked}
       />
 
       <GroupManagementDialog
@@ -1017,6 +1161,7 @@ export default function Home() {
         onAssignmentComplete={handleProxyAssignmentComplete}
         profiles={profiles}
         storedProxies={storedProxies}
+        vpnConfigs={vpnConfigs}
       />
 
       <CookieCopyDialog
@@ -1029,6 +1174,15 @@ export default function Home() {
         profiles={profiles}
         runningProfiles={runningProfiles}
         onCopyComplete={() => setSelectedProfilesForCookies([])}
+      />
+
+      <CookieManagementDialog
+        isOpen={cookieManagementDialogOpen}
+        onClose={() => {
+          setCookieManagementDialogOpen(false);
+          setCurrentProfileForCookieManagement(null);
+        }}
+        profile={currentProfileForCookieManagement}
       />
 
       <DeleteConfirmationDialog
@@ -1045,7 +1199,18 @@ export default function Home() {
 
       <SyncConfigDialog
         isOpen={syncConfigDialogOpen}
-        onClose={() => setSyncConfigDialogOpen(false)}
+        onClose={(loginOccurred) => {
+          setSyncConfigDialogOpen(false);
+          void checkSelfHostedSync();
+          if (loginOccurred) {
+            setSyncAllDialogOpen(true);
+          }
+        }}
+      />
+
+      <SyncAllDialog
+        isOpen={syncAllDialogOpen}
+        onClose={() => setSyncAllDialogOpen(false)}
       />
 
       <ProfileSyncDialog
@@ -1079,6 +1244,15 @@ export default function Home() {
       <LaunchOnLoginDialog
         isOpen={launchOnLoginDialogOpen}
         onClose={() => setLaunchOnLoginDialogOpen(false)}
+      />
+
+      <WindowResizeWarningDialog
+        isOpen={windowResizeWarningOpen}
+        onResult={(proceed) => {
+          setWindowResizeWarningOpen(false);
+          windowResizeWarningResolver.current?.(proceed);
+          windowResizeWarningResolver.current = null;
+        }}
       />
     </div>
   );

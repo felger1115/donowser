@@ -545,6 +545,7 @@ impl ProfileImporter {
       browser: browser_type.to_string(),
       version: available_versions,
       proxy_id: None,
+      vpn_id: None,
       process_id: None,
       last_launch: None,
       release_type: "stable".to_string(),
@@ -553,8 +554,11 @@ impl ProfileImporter {
       group_id: None,
       tags: Vec::new(),
       note: None,
-      sync_enabled: false,
+      sync_mode: crate::profile::types::SyncMode::Disabled,
+      encryption_salt: None,
       last_sync: None,
+      host_os: Some(crate::profile::types::get_host_os()),
+      ephemeral: false,
     };
 
     // Save the profile metadata

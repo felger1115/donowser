@@ -17,6 +17,7 @@ export interface BrowserProfile {
   browser: string;
   version: string;
   proxy_id?: string; // Reference to stored proxy
+  vpn_id?: string; // Reference to stored VPN config
   process_id?: number;
   last_launch?: number;
   release_type: string; // "stable" or "nightly"
@@ -25,15 +26,37 @@ export interface BrowserProfile {
   group_id?: string; // Reference to profile group
   tags?: string[];
   note?: string; // User note
-  sync_enabled?: boolean; // Whether sync is enabled for this profile
+  sync_mode?: SyncMode;
+  encryption_salt?: string;
   last_sync?: number; // Timestamp of last successful sync (epoch seconds)
+  host_os?: string; // OS where profile was created ("macos", "windows", "linux")
+  ephemeral?: boolean;
 }
+
+export type SyncMode = "Disabled" | "Regular" | "Encrypted";
 
 export type SyncStatus = "Disabled" | "Syncing" | "Synced" | "Error";
 
 export interface SyncSettings {
   sync_server_url?: string;
   sync_token?: string;
+}
+
+export interface CloudUser {
+  id: string;
+  email: string;
+  plan: string;
+  planPeriod: string | null;
+  subscriptionStatus: string;
+  profileLimit: number;
+  cloudProfilesUsed: number;
+  proxyBandwidthLimitMb: number;
+  proxyBandwidthUsedMb: number;
+}
+
+export interface CloudAuthState {
+  user: CloudUser;
+  logged_in_at: string;
 }
 
 export interface ProfileSyncStatusEvent {
@@ -50,12 +73,28 @@ export interface ProxyCheckResult {
   is_valid: boolean;
 }
 
+export function isSyncEnabled(profile: BrowserProfile): boolean {
+  return profile.sync_mode != null && profile.sync_mode !== "Disabled";
+}
+
+export const CLOUD_PROXY_ID = "cloud-included-proxy";
+
 export interface StoredProxy {
   id: string;
   name: string;
   proxy_settings: ProxySettings;
   sync_enabled?: boolean;
   last_sync?: number;
+  is_cloud_managed?: boolean;
+  is_cloud_derived?: boolean;
+  geo_country?: string;
+  geo_state?: string;
+  geo_city?: string;
+}
+
+export interface LocationItem {
+  code: string;
+  name: string;
 }
 
 export interface ProfileGroup {
@@ -575,6 +614,8 @@ export interface VpnConfig {
   config_data: string; // Raw config content (may be empty in list view)
   created_at: number;
   last_used?: number;
+  sync_enabled?: boolean;
+  last_sync?: number;
 }
 
 export interface VpnImportResult {

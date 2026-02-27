@@ -1,4 +1,3 @@
-use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -71,16 +70,7 @@ impl DownloadedBrowsersRegistry {
   }
 
   fn get_registry_path() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let base_dirs = BaseDirs::new().ok_or("Failed to get base directories")?;
-    let mut path = base_dirs.data_local_dir().to_path_buf();
-    path.push(if cfg!(debug_assertions) {
-      "DonutBrowserDev"
-    } else {
-      "DonutBrowser"
-    });
-    path.push("data");
-    path.push("downloaded_browsers.json");
-    Ok(path)
+    Ok(crate::app_dirs::data_subdir().join("downloaded_browsers.json"))
   }
 
   pub fn add_browser(&self, info: DownloadedBrowserInfo) {
@@ -128,19 +118,7 @@ impl DownloadedBrowsersRegistry {
     };
     let browser_instance = create_browser(browser_type.clone());
 
-    // Get binaries directory
-    let binaries_dir = if let Some(base_dirs) = directories::BaseDirs::new() {
-      let mut path = base_dirs.data_local_dir().to_path_buf();
-      path.push(if cfg!(debug_assertions) {
-        "DonutBrowserDev"
-      } else {
-        "DonutBrowser"
-      });
-      path.push("binaries");
-      path
-    } else {
-      return false;
-    };
+    let binaries_dir = crate::app_dirs::binaries_dir();
 
     let files_exist = browser_instance.is_version_downloaded(version, &binaries_dir);
 
@@ -310,6 +288,30 @@ impl DownloadedBrowsersRegistry {
           log::info!("Marking for removal: {browser} {version} (not used by any profile)");
         }
       }
+    }
+
+    // Filter out versions that would leave a browser with zero versions in the registry
+    {
+      let data = self.data.lock().unwrap();
+      let mut removal_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+      for (browser, _) in &to_remove {
+        *removal_counts.entry(browser.clone()).or_insert(0) += 1;
+      }
+      to_remove.retain(|(browser, version)| {
+        let total = data
+          .browsers
+          .get(browser.as_str())
+          .map(|v| v.len())
+          .unwrap_or(0);
+        let removing = *removal_counts.get(browser.as_str()).unwrap_or(&0);
+        if removing >= total {
+          log::info!("Keeping last available version: {browser} {version}");
+          *removal_counts.get_mut(browser.as_str()).unwrap() -= 1;
+          return false;
+        }
+        true
+      });
     }
 
     // Remove unused binaries and their version folders
@@ -511,15 +513,7 @@ impl DownloadedBrowsersRegistry {
     browser: &str,
     version: &str,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Get binaries directory path
-    let base_dirs = directories::BaseDirs::new().ok_or("Failed to get base directories")?;
-    let mut binaries_dir = base_dirs.data_local_dir().to_path_buf();
-    binaries_dir.push(if cfg!(debug_assertions) {
-      "DonutBrowserDev"
-    } else {
-      "DonutBrowser"
-    });
-    binaries_dir.push("binaries");
+    let binaries_dir = crate::app_dirs::binaries_dir();
 
     let version_dir = binaries_dir.join(browser).join(version);
 
@@ -806,19 +800,7 @@ impl DownloadedBrowsersRegistry {
 
       let browser = create_browser(browser_type.clone());
 
-      // Get binaries directory
-      let binaries_dir = if let Some(base_dirs) = directories::BaseDirs::new() {
-        let mut path = base_dirs.data_local_dir().to_path_buf();
-        path.push(if cfg!(debug_assertions) {
-          "DonutBrowserDev"
-        } else {
-          "DonutBrowser"
-        });
-        path.push("binaries");
-        path
-      } else {
-        return Err("Failed to get base directories".into());
-      };
+      let binaries_dir = crate::app_dirs::binaries_dir();
 
       log::info!(
         "binaries_dir: {binaries_dir:?} for profile: {}",
@@ -1165,6 +1147,58 @@ mod tests {
   }
 
   #[test]
+  fn test_last_version_kept_during_cleanup() {
+    let registry = DownloadedBrowsersRegistry::new();
+
+    // Add a single version for "firefox"
+    registry.add_browser(DownloadedBrowserInfo {
+      browser: "firefox".to_string(),
+      version: "139.0".to_string(),
+      file_path: PathBuf::from("/test/firefox/139.0"),
+    });
+
+    // Add two versions for "chromium"
+    registry.add_browser(DownloadedBrowserInfo {
+      browser: "chromium".to_string(),
+      version: "120.0".to_string(),
+      file_path: PathBuf::from("/test/chromium/120.0"),
+    });
+    registry.add_browser(DownloadedBrowserInfo {
+      browser: "chromium".to_string(),
+      version: "121.0".to_string(),
+      file_path: PathBuf::from("/test/chromium/121.0"),
+    });
+
+    // No active or running profiles
+    let result = registry
+      .cleanup_unused_binaries_internal(&[], &[])
+      .expect("cleanup should succeed");
+
+    // firefox 139.0 should be kept (last version), chromium should lose one but keep one
+    // The exact one kept depends on iteration order, but at least one must remain
+    assert!(
+      !result.contains(&"firefox 139.0".to_string()),
+      "Last version of firefox should not be cleaned up"
+    );
+    // At most one chromium version should have been cleaned up
+    let chromium_cleaned: Vec<_> = result
+      .iter()
+      .filter(|r| r.starts_with("chromium"))
+      .collect();
+    assert!(
+      chromium_cleaned.len() <= 1,
+      "At most one chromium version should be cleaned up, got: {:?}",
+      chromium_cleaned
+    );
+
+    // Verify firefox is still registered
+    assert!(
+      registry.is_browser_registered("firefox", "139.0"),
+      "Last firefox version should still be registered"
+    );
+  }
+
+  #[test]
   fn test_is_browser_registered_vs_downloaded() {
     let registry = DownloadedBrowsersRegistry::new();
     let info = DownloadedBrowserInfo {
@@ -1189,6 +1223,64 @@ mod tests {
       "Browser should not be considered downloaded when files don't exist on disk"
     );
   }
+}
+
+#[tauri::command]
+pub async fn ensure_active_browsers_downloaded(
+  app_handle: tauri::AppHandle,
+) -> Result<Vec<String>, String> {
+  let registry = DownloadedBrowsersRegistry::instance();
+  let version_manager = crate::browser_version_manager::BrowserVersionManager::instance();
+  let mut downloaded = Vec::new();
+
+  for browser in &["wayfern", "camoufox"] {
+    // Check if any version is already downloaded
+    let existing = registry.get_downloaded_versions(browser);
+    if !existing.is_empty() {
+      log::debug!(
+        "Skipping {browser}: already have {} version(s) downloaded",
+        existing.len()
+      );
+      continue;
+    }
+
+    // Get the latest release type for this browser
+    let release_types = match version_manager.get_browser_release_types(browser).await {
+      Ok(rt) => rt,
+      Err(e) => {
+        log::warn!("Failed to get release types for {browser}: {e}");
+        continue;
+      }
+    };
+
+    // Use stable version (the only release type for these browsers)
+    let version = match release_types.stable {
+      Some(v) => v,
+      None => {
+        log::debug!("No stable version available for {browser} on this platform, skipping");
+        continue;
+      }
+    };
+
+    log::info!("Auto-downloading {browser} {version} (no versions found locally)");
+    match crate::downloader::download_browser(
+      app_handle.clone(),
+      browser.to_string(),
+      version.clone(),
+    )
+    .await
+    {
+      Ok(_) => {
+        downloaded.push(format!("{browser} {version}"));
+        log::info!("Successfully auto-downloaded {browser} {version}");
+      }
+      Err(e) => {
+        log::warn!("Failed to auto-download {browser} {version}: {e}");
+      }
+    }
+  }
+
+  Ok(downloaded)
 }
 
 #[tauri::command]

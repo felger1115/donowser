@@ -6,13 +6,11 @@ use crate::platform_browser;
 use crate::profile::{BrowserProfile, ProfileManager};
 use crate::proxy_manager::PROXY_MANAGER;
 use crate::wayfern_manager::{WayfernConfig, WayfernManager};
-use directories::BaseDirs;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::System;
 pub struct BrowserRunner {
-  base_dirs: BaseDirs,
   pub profile_manager: &'static ProfileManager,
   pub downloaded_browsers_registry: &'static DownloadedBrowsersRegistry,
   auto_updater: &'static crate::auto_updater::AutoUpdater,
@@ -23,7 +21,6 @@ pub struct BrowserRunner {
 impl BrowserRunner {
   fn new() -> Self {
     Self {
-      base_dirs: BaseDirs::new().expect("Failed to get base directories"),
       profile_manager: ProfileManager::instance(),
       downloaded_browsers_registry: DownloadedBrowsersRegistry::instance(),
       auto_updater: crate::auto_updater::AutoUpdater::instance(),
@@ -37,14 +34,7 @@ impl BrowserRunner {
   }
 
   pub fn get_binaries_dir(&self) -> PathBuf {
-    let mut path = self.base_dirs.data_local_dir().to_path_buf();
-    path.push(if cfg!(debug_assertions) {
-      "DonutBrowserDev"
-    } else {
-      "DonutBrowser"
-    });
-    path.push("binaries");
-    path
+    crate::app_dirs::binaries_dir()
   }
 
   /// Get the executable path for a browser profile
@@ -90,17 +80,6 @@ impl BrowserRunner {
     remote_debugging_port: Option<u16>,
     headless: bool,
   ) -> Result<BrowserProfile, Box<dyn std::error::Error + Send + Sync>> {
-    // Check if browser is disabled due to ongoing update
-    if self.auto_updater.is_browser_disabled(&profile.browser)? {
-      return Err(
-        format!(
-          "{} is currently being updated. Please wait for the update to complete.",
-          profile.browser
-        )
-        .into(),
-      );
-    }
-
     // Handle Camoufox profiles using CamoufoxManager
     if profile.browser == "camoufox" {
       // Get or create camoufox config
@@ -113,10 +92,33 @@ impl BrowserRunner {
       });
 
       // Always start a local proxy for Camoufox (for traffic monitoring and geoip support)
-      let upstream_proxy = profile
+      let mut upstream_proxy = profile
         .proxy_id
         .as_ref()
         .and_then(|id| PROXY_MANAGER.get_proxy_settings_by_id(id));
+
+      // If profile has a VPN instead of proxy, start VPN worker and use it as upstream
+      if upstream_proxy.is_none() {
+        if let Some(ref vpn_id) = profile.vpn_id {
+          match crate::vpn_worker_runner::start_vpn_worker(vpn_id).await {
+            Ok(vpn_worker) => {
+              if let Some(port) = vpn_worker.local_port {
+                upstream_proxy = Some(ProxySettings {
+                  proxy_type: "socks5".to_string(),
+                  host: "127.0.0.1".to_string(),
+                  port,
+                  username: None,
+                  password: None,
+                });
+                log::info!("VPN worker started for Camoufox profile on port {}", port);
+              }
+            }
+            Err(e) => {
+              return Err(format!("Failed to start VPN worker: {e}").into());
+            }
+          }
+        }
+      }
 
       log::info!(
         "Starting local proxy for Camoufox profile: {} (upstream: {})",
@@ -208,6 +210,23 @@ impl BrowserRunner {
         );
       }
 
+      // Ensure DuckDuckGo is set as default search engine for Camoufox
+      let mut browser_dir = self.get_binaries_dir();
+      browser_dir.push(&profile.browser);
+      browser_dir.push(&profile.version);
+      if let Err(e) = crate::downloader::configure_camoufox_search_engine(&browser_dir) {
+        log::warn!("Failed to configure Camoufox search engine: {e}");
+      }
+
+      // Create ephemeral dir for ephemeral profiles
+      let override_profile_path = if profile.ephemeral {
+        let dir = crate::ephemeral_dirs::create_ephemeral_dir(&profile.id.to_string())
+          .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        Some(dir)
+      } else {
+        None
+      };
+
       // Launch Camoufox browser
       log::info!("Launching Camoufox for profile: {}", profile.name);
       let camoufox_result = self
@@ -217,6 +236,7 @@ impl BrowserRunner {
           updated_profile.clone(),
           camoufox_config,
           url,
+          override_profile_path,
         )
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -312,10 +332,33 @@ impl BrowserRunner {
       });
 
       // Always start a local proxy for Wayfern (for traffic monitoring and geoip support)
-      let upstream_proxy = profile
+      let mut upstream_proxy = profile
         .proxy_id
         .as_ref()
         .and_then(|id| PROXY_MANAGER.get_proxy_settings_by_id(id));
+
+      // If profile has a VPN instead of proxy, start VPN worker and use it as upstream
+      if upstream_proxy.is_none() {
+        if let Some(ref vpn_id) = profile.vpn_id {
+          match crate::vpn_worker_runner::start_vpn_worker(vpn_id).await {
+            Ok(vpn_worker) => {
+              if let Some(port) = vpn_worker.local_port {
+                upstream_proxy = Some(ProxySettings {
+                  proxy_type: "socks5".to_string(),
+                  host: "127.0.0.1".to_string(),
+                  port,
+                  username: None,
+                  password: None,
+                });
+                log::info!("VPN worker started for Wayfern profile on port {}", port);
+              }
+            }
+            Err(e) => {
+              return Err(format!("Failed to start VPN worker: {e}").into());
+            }
+          }
+        }
+      }
 
       log::info!(
         "Starting local proxy for Wayfern profile: {} (upstream: {})",
@@ -397,12 +440,19 @@ impl BrowserRunner {
         );
       }
 
+      // Create ephemeral dir for ephemeral profiles
+      if profile.ephemeral {
+        crate::ephemeral_dirs::create_ephemeral_dir(&profile.id.to_string())
+          .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+      }
+
       // Launch Wayfern browser
       log::info!("Launching Wayfern for profile: {}", profile.name);
 
       // Get profile path for Wayfern
       let profiles_dir = self.profile_manager.get_profiles_dir();
-      let profile_data_path = updated_profile.get_profile_data_path(&profiles_dir);
+      let profile_data_path =
+        crate::ephemeral_dirs::get_effective_profile_path(&updated_profile, &profiles_dir);
       let profile_path_str = profile_data_path.to_string_lossy().to_string();
 
       // Get proxy URL from config
@@ -417,6 +467,7 @@ impl BrowserRunner {
           &wayfern_config,
           url.as_deref(),
           proxy_url,
+          profile.ephemeral,
         )
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -749,7 +800,8 @@ impl BrowserRunner {
     if profile.browser == "camoufox" {
       // Get the profile path based on the UUID
       let profiles_dir = self.profile_manager.get_profiles_dir();
-      let profile_data_path = profile.get_profile_data_path(&profiles_dir);
+      let profile_data_path =
+        crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
       let profile_path_str = profile_data_path.to_string_lossy();
 
       // Check if the process is running
@@ -803,7 +855,8 @@ impl BrowserRunner {
     // Handle Wayfern profiles using WayfernManager
     if profile.browser == "wayfern" {
       let profiles_dir = self.profile_manager.get_profiles_dir();
-      let profile_data_path = profile.get_profile_data_path(&profiles_dir);
+      let profile_data_path =
+        crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
       let profile_path_str = profile_data_path.to_string_lossy();
 
       // Check if the process is running
@@ -1201,7 +1254,8 @@ impl BrowserRunner {
     if profile.browser == "camoufox" {
       // Search by profile path to find the running Camoufox instance
       let profiles_dir = self.profile_manager.get_profiles_dir();
-      let profile_data_path = profile.get_profile_data_path(&profiles_dir);
+      let profile_data_path =
+        crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
       let profile_path_str = profile_data_path.to_string_lossy();
 
       log::info!(
@@ -1619,6 +1673,10 @@ impl BrowserRunner {
         );
       }
 
+      if profile.ephemeral {
+        crate::ephemeral_dirs::remove_ephemeral_dir(&profile.id.to_string());
+      }
+
       log::info!(
         "Camoufox process cleanup completed for profile: {} (ID: {})",
         profile.name,
@@ -1644,7 +1702,8 @@ impl BrowserRunner {
     // Handle Wayfern profiles using WayfernManager
     if profile.browser == "wayfern" {
       let profiles_dir = self.profile_manager.get_profiles_dir();
-      let profile_data_path = profile.get_profile_data_path(&profiles_dir);
+      let profile_data_path =
+        crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
       let profile_path_str = profile_data_path.to_string_lossy();
 
       log::info!(
@@ -1935,6 +1994,10 @@ impl BrowserRunner {
           updated_profile.name,
           payload.is_running
         );
+      }
+
+      if profile.ephemeral {
+        crate::ephemeral_dirs::remove_ephemeral_dir(&profile.id.to_string());
       }
 
       log::info!(
@@ -2355,6 +2418,14 @@ impl BrowserRunner {
       .find(|p| p.id.to_string() == profile_id)
       .ok_or_else(|| format!("Profile '{profile_id}' not found"))?;
 
+    if profile.is_cross_os() {
+      return Err(format!(
+        "Cannot open URL with profile '{}': it was created on {} and is not supported on this system",
+        profile.name,
+        profile.host_os.as_deref().unwrap_or("unknown")
+      ));
+    }
+
     log::info!("Opening URL '{url}' with profile '{profile_id}'");
 
     // Use launch_or_open_url which handles both launching new instances and opening in existing ones
@@ -2382,6 +2453,14 @@ pub async fn launch_browser_profile(
     profile.name,
     profile.id
   );
+
+  if profile.is_cross_os() {
+    return Err(format!(
+      "Cannot launch profile '{}': it was created on {} and is not supported on this system",
+      profile.name,
+      profile.host_os.as_deref().unwrap_or("unknown")
+    ));
+  }
 
   let browser_runner = BrowserRunner::instance();
 
@@ -2413,10 +2492,33 @@ pub async fn launch_browser_profile(
   // This ensures all traffic goes through the local proxy for monitoring and future features
   if profile.browser != "camoufox" && profile.browser != "wayfern" {
     // Determine upstream proxy if configured; otherwise use DIRECT (no upstream)
-    let upstream_proxy = profile_for_launch
+    let mut upstream_proxy = profile_for_launch
       .proxy_id
       .as_ref()
       .and_then(|id| PROXY_MANAGER.get_proxy_settings_by_id(id));
+
+    // If profile has a VPN instead of proxy, start VPN worker and use it as upstream
+    if upstream_proxy.is_none() {
+      if let Some(ref vpn_id) = profile_for_launch.vpn_id {
+        match crate::vpn_worker_runner::start_vpn_worker(vpn_id).await {
+          Ok(vpn_worker) => {
+            if let Some(port) = vpn_worker.local_port {
+              upstream_proxy = Some(ProxySettings {
+                proxy_type: "socks5".to_string(),
+                host: "127.0.0.1".to_string(),
+                port,
+                username: None,
+                password: None,
+              });
+              log::info!("VPN worker started for profile on port {}", port);
+            }
+          }
+          Err(e) => {
+            return Err(format!("Failed to start VPN worker: {e}"));
+          }
+        }
+      }
+    }
 
     // Use a temporary PID (1) to start the proxy, we'll update it after browser launch
     let temp_pid = 1u32;
@@ -2595,6 +2697,14 @@ pub async fn launch_browser_profile_with_debugging(
   remote_debugging_port: Option<u16>,
   headless: bool,
 ) -> Result<BrowserProfile, String> {
+  if profile.is_cross_os() {
+    return Err(format!(
+      "Cannot launch profile '{}': it was created on {} and is not supported on this system",
+      profile.name,
+      profile.host_os.as_deref().unwrap_or("unknown")
+    ));
+  }
+
   let browser_runner = BrowserRunner::instance();
   browser_runner
     .launch_browser_with_debugging(app_handle, &profile, url, remote_debugging_port, headless)

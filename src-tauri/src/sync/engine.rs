@@ -1,8 +1,9 @@
 use super::client::SyncClient;
+use super::encryption;
 use super::manifest::{compute_diff, generate_manifest, get_cache_path, HashCache, SyncManifest};
 use super::types::*;
 use crate::events;
-use crate::profile::types::BrowserProfile;
+use crate::profile::types::{BrowserProfile, SyncMode};
 use crate::profile::ProfileManager;
 use crate::settings_manager::SettingsManager;
 use chrono::{DateTime, Utc};
@@ -11,6 +12,18 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+
+/// Check if sync is configured (cloud or self-hosted)
+pub fn is_sync_configured() -> bool {
+  if crate::cloud_auth::CLOUD_AUTH.has_active_paid_subscription_sync() {
+    return true;
+  }
+  let manager = SettingsManager::instance();
+  if let Ok(settings) = manager.load_settings() {
+    return settings.sync_server_url.is_some();
+  }
+  false
+}
 
 pub struct SyncEngine {
   client: SyncClient,
@@ -24,6 +37,18 @@ impl SyncEngine {
   }
 
   pub async fn create_from_settings(app_handle: &tauri::AppHandle) -> Result<Self, String> {
+    // Cloud auth takes priority
+    if crate::cloud_auth::CLOUD_AUTH.is_logged_in().await {
+      let url = crate::cloud_auth::CLOUD_SYNC_URL.to_string();
+      let token = crate::cloud_auth::CLOUD_AUTH
+        .get_or_refresh_sync_token()
+        .await
+        .map_err(|e| format!("Failed to get cloud sync token: {e}"))?
+        .ok_or_else(|| "Cloud sync token not available".to_string())?;
+      return Ok(Self::new(url, token));
+    }
+
+    // Fall back to self-hosted settings
     let manager = SettingsManager::instance();
     let settings = manager
       .load_settings()
@@ -47,6 +72,33 @@ impl SyncEngine {
     app_handle: &tauri::AppHandle,
     profile: &BrowserProfile,
   ) -> SyncResult<()> {
+    if profile.is_cross_os() {
+      log::info!(
+        "Skipping file sync for cross-OS profile: {} ({})",
+        profile.name,
+        profile.id
+      );
+      return Ok(());
+    }
+
+    // Derive encryption key if encrypted sync
+    let encryption_key = if profile.is_encrypted_sync() {
+      let password = encryption::load_e2e_password()
+        .map_err(|e| SyncError::InvalidData(format!("Failed to load E2E password: {e}")))?
+        .ok_or_else(|| {
+          let _ = events::emit("profile-sync-e2e-password-required", ());
+          SyncError::InvalidData("E2E password not set".to_string())
+        })?;
+      let salt = profile.encryption_salt.as_deref().ok_or_else(|| {
+        SyncError::InvalidData("Encryption salt missing on encrypted profile".to_string())
+      })?;
+      let key = encryption::derive_profile_key(&password, salt)
+        .map_err(|e| SyncError::InvalidData(format!("Key derivation failed: {e}")))?;
+      Some(key)
+    } else {
+      None
+    };
+
     let profile_manager = ProfileManager::instance();
     let profiles_dir = profile_manager.get_profiles_dir();
     let profile_dir = profiles_dir.join(profile.id.to_string());
@@ -80,6 +132,24 @@ impl SyncEngine {
 
     // Generate local manifest
     let local_manifest = generate_manifest(&profile_id, &profile_dir, &mut hash_cache)?;
+
+    let total_size: u64 = local_manifest.files.iter().map(|f| f.size).sum();
+    let has_cookies = local_manifest
+      .files
+      .iter()
+      .any(|f| f.path.contains("Cookies") || f.path.contains("cookies"));
+    let has_local_state = local_manifest
+      .files
+      .iter()
+      .any(|f| f.path.contains("Local State"));
+    log::info!(
+      "Profile {} manifest: {} files, {} bytes total, cookies={}, local_state={}",
+      profile_id,
+      local_manifest.files.len(),
+      total_size,
+      has_cookies,
+      has_local_state
+    );
 
     // Save the hash cache for future runs
     hash_cache.save(&cache_path)?;
@@ -115,7 +185,13 @@ impl SyncEngine {
     // Perform uploads
     if !diff.files_to_upload.is_empty() {
       self
-        .upload_profile_files(app_handle, &profile_id, &profile_dir, &diff.files_to_upload)
+        .upload_profile_files(
+          app_handle,
+          &profile_id,
+          &profile_dir,
+          &diff.files_to_upload,
+          encryption_key.as_ref(),
+        )
         .await?;
     }
 
@@ -127,6 +203,7 @@ impl SyncEngine {
           &profile_id,
           &profile_dir,
           &diff.files_to_download,
+          encryption_key.as_ref(),
         )
         .await?;
     }
@@ -151,14 +228,19 @@ impl SyncEngine {
     self.upload_profile_metadata(&profile_id, profile).await?;
 
     // Upload manifest.json last for atomicity
-    self.upload_manifest(&profile_id, &local_manifest).await?;
+    let mut final_manifest = local_manifest;
+    final_manifest.encrypted = encryption_key.is_some();
+    self.upload_manifest(&profile_id, &final_manifest).await?;
 
-    // Sync associated proxy and group
+    // Sync associated proxy, group, and VPN
     if let Some(proxy_id) = &profile.proxy_id {
       let _ = self.sync_proxy(proxy_id, Some(app_handle)).await;
     }
     if let Some(group_id) = &profile.group_id {
       let _ = self.sync_group(group_id, Some(app_handle)).await;
+    }
+    if let Some(vpn_id) = &profile.vpn_id {
+      let _ = self.sync_vpn(vpn_id, Some(app_handle)).await;
     }
 
     // Update profile last_sync
@@ -249,6 +331,7 @@ impl SyncEngine {
     profile_id: &str,
     profile_dir: &Path,
     files: &[super::manifest::ManifestFileEntry],
+    encryption_key: Option<&[u8; 32]>,
   ) -> SyncResult<()> {
     if files.is_empty() {
       return Ok(());
@@ -282,6 +365,7 @@ impl SyncEngine {
     let client = self.client.clone();
     let profile_dir = profile_dir.to_path_buf();
     let profile_id = profile_id.to_string();
+    let enc_key = encryption_key.copied();
 
     let mut handles = Vec::new();
 
@@ -313,8 +397,20 @@ impl SyncEngine {
           }
         };
 
+        let upload_data = if let Some(ref key) = enc_key {
+          match encryption::encrypt_bytes(key, &data) {
+            Ok(encrypted) => encrypted,
+            Err(e) => {
+              log::warn!("Failed to encrypt {}: {}", file_path.display(), e);
+              return;
+            }
+          }
+        } else {
+          data
+        };
+
         if let Err(e) = client
-          .upload_bytes(&url, &data, content_type.as_deref())
+          .upload_bytes(&url, &upload_data, content_type.as_deref())
           .await
         {
           log::warn!("Failed to upload {}: {}", file_path.display(), e);
@@ -345,6 +441,7 @@ impl SyncEngine {
     profile_id: &str,
     profile_dir: &Path,
     files: &[super::manifest::ManifestFileEntry],
+    encryption_key: Option<&[u8; 32]>,
   ) -> SyncResult<()> {
     if files.is_empty() {
       return Ok(());
@@ -376,6 +473,7 @@ impl SyncEngine {
     let client = self.client.clone();
     let profile_dir = profile_dir.to_path_buf();
     let profile_id = profile_id.to_string();
+    let enc_key = encryption_key.copied();
 
     let mut handles = Vec::new();
 
@@ -398,10 +496,22 @@ impl SyncEngine {
 
         match client.download_bytes(&url).await {
           Ok(data) => {
+            let write_data = if let Some(ref key) = enc_key {
+              match encryption::decrypt_bytes(key, &data) {
+                Ok(decrypted) => decrypted,
+                Err(e) => {
+                  log::warn!("Failed to decrypt {}, skipping: {}", remote_key, e);
+                  return;
+                }
+              }
+            } else {
+              data
+            };
+
             if let Some(parent) = file_path.parent() {
               let _ = fs::create_dir_all(parent);
             }
-            if let Err(e) = fs::write(&file_path, &data) {
+            if let Err(e) = fs::write(&file_path, &write_data) {
               log::warn!("Failed to write {}: {}", file_path.display(), e);
             }
           }
@@ -764,6 +874,145 @@ impl SyncEngine {
     Ok(())
   }
 
+  async fn sync_vpn(&self, vpn_id: &str, app_handle: Option<&tauri::AppHandle>) -> SyncResult<()> {
+    let local_vpn = {
+      let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+      storage.load_config(vpn_id).ok()
+    };
+
+    let remote_key = format!("vpns/{}.json", vpn_id);
+    let stat = self.client.stat(&remote_key).await?;
+
+    match (local_vpn, stat.exists) {
+      (Some(vpn), true) => {
+        let local_updated = vpn.last_sync.unwrap_or(0);
+        let remote_updated: DateTime<Utc> = stat
+          .last_modified
+          .as_ref()
+          .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+          .map(|dt| dt.with_timezone(&Utc))
+          .unwrap_or_else(Utc::now);
+        let remote_ts = remote_updated.timestamp() as u64;
+
+        if remote_ts > local_updated {
+          self.download_vpn(vpn_id, app_handle).await?;
+        } else if local_updated > remote_ts {
+          self.upload_vpn(&vpn).await?;
+        }
+      }
+      (Some(vpn), false) => {
+        self.upload_vpn(&vpn).await?;
+      }
+      (None, true) => {
+        self.download_vpn(vpn_id, app_handle).await?;
+      }
+      (None, false) => {
+        log::debug!("VPN {} not found locally or remotely", vpn_id);
+      }
+    }
+
+    Ok(())
+  }
+
+  async fn upload_vpn(&self, vpn: &crate::vpn::VpnConfig) -> SyncResult<()> {
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_secs();
+
+    let mut updated_vpn = vpn.clone();
+    updated_vpn.last_sync = Some(now);
+
+    let json = serde_json::to_string_pretty(&updated_vpn)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to serialize VPN: {e}")))?;
+
+    let remote_key = format!("vpns/{}.json", vpn.id);
+    let presign = self
+      .client
+      .presign_upload(&remote_key, Some("application/json"))
+      .await?;
+    self
+      .client
+      .upload_bytes(&presign.url, json.as_bytes(), Some("application/json"))
+      .await?;
+
+    // Update local VPN with new last_sync
+    {
+      let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+      if let Err(e) = storage.update_sync_fields(&vpn.id, vpn.sync_enabled, Some(now)) {
+        log::warn!("Failed to update VPN last_sync: {}", e);
+      }
+    }
+
+    log::info!("VPN {} uploaded", vpn.id);
+    Ok(())
+  }
+
+  async fn download_vpn(
+    &self,
+    vpn_id: &str,
+    app_handle: Option<&tauri::AppHandle>,
+  ) -> SyncResult<()> {
+    let remote_key = format!("vpns/{}.json", vpn_id);
+    let presign = self.client.presign_download(&remote_key).await?;
+    let data = self.client.download_bytes(&presign.url).await?;
+
+    let mut vpn: crate::vpn::VpnConfig = serde_json::from_slice(&data)
+      .map_err(|e| SyncError::SerializationError(format!("Failed to parse VPN JSON: {e}")))?;
+
+    vpn.last_sync = Some(
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs(),
+    );
+    vpn.sync_enabled = true;
+
+    // Save via VPN storage (handles encryption)
+    {
+      let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+      if let Err(e) = storage.save_config(&vpn) {
+        log::warn!("Failed to save downloaded VPN: {}", e);
+      }
+    }
+
+    // Emit event for UI update
+    if let Some(_handle) = app_handle {
+      let _ = events::emit("vpn-configs-changed", ());
+      let _ = events::emit(
+        "vpn-sync-status",
+        serde_json::json!({
+          "id": vpn_id,
+          "status": "synced"
+        }),
+      );
+    }
+
+    log::info!("VPN {} downloaded", vpn_id);
+    Ok(())
+  }
+
+  pub async fn sync_vpn_by_id_with_handle(
+    &self,
+    vpn_id: &str,
+    app_handle: &tauri::AppHandle,
+  ) -> SyncResult<()> {
+    self.sync_vpn(vpn_id, Some(app_handle)).await
+  }
+
+  pub async fn delete_vpn(&self, vpn_id: &str) -> SyncResult<()> {
+    let remote_key = format!("vpns/{}.json", vpn_id);
+    let tombstone_key = format!("tombstones/vpns/{}.json", vpn_id);
+
+    self
+      .client
+      .delete(&remote_key, Some(&tombstone_key))
+      .await?;
+
+    log::info!("VPN {} deleted from sync", vpn_id);
+    Ok(())
+  }
+
   /// Download a profile from S3 if it exists remotely but not locally
   pub async fn download_profile_if_missing(
     &self,
@@ -820,12 +1069,77 @@ impl SyncEngine {
     let mut profile: BrowserProfile = serde_json::from_slice(&metadata_data)
       .map_err(|e| SyncError::SerializationError(format!("Failed to parse metadata: {e}")))?;
 
+    // Cross-OS profile: save metadata only, skip manifest + file downloads
+    if profile.is_cross_os() {
+      log::info!(
+        "Profile {} is cross-OS (host_os={:?}), downloading metadata only",
+        profile_id,
+        profile.host_os
+      );
+
+      fs::create_dir_all(&profile_dir).map_err(|e| {
+        SyncError::IoError(format!(
+          "Failed to create profile directory {}: {e}",
+          profile_dir.display()
+        ))
+      })?;
+
+      if profile.sync_mode == SyncMode::Disabled {
+        profile.sync_mode = SyncMode::Regular;
+      }
+      profile.last_sync = Some(
+        std::time::SystemTime::now()
+          .duration_since(std::time::UNIX_EPOCH)
+          .unwrap()
+          .as_secs(),
+      );
+
+      profile_manager
+        .save_profile(&profile)
+        .map_err(|e| SyncError::IoError(format!("Failed to save cross-OS profile: {e}")))?;
+
+      let _ = events::emit("profiles-changed", ());
+      let _ = events::emit(
+        "profile-sync-status",
+        serde_json::json!({
+          "profile_id": profile_id,
+          "status": "synced"
+        }),
+      );
+
+      log::info!(
+        "Cross-OS profile {} metadata downloaded successfully",
+        profile_id
+      );
+      return Ok(true);
+    }
+
     // Download manifest
     let manifest = self.download_manifest(&manifest_key).await?;
     let Some(manifest) = manifest else {
       return Err(SyncError::InvalidData(
         "Remote manifest not found".to_string(),
       ));
+    };
+
+    // If remote manifest is encrypted, we need the E2E password
+    let encryption_key = if manifest.encrypted {
+      let password = encryption::load_e2e_password()
+        .map_err(|e| SyncError::InvalidData(format!("Failed to load E2E password: {e}")))?
+        .ok_or_else(|| {
+          let _ = events::emit("profile-sync-e2e-password-required", ());
+          SyncError::InvalidData(
+            "Remote profile is encrypted but no E2E password is set".to_string(),
+          )
+        })?;
+      let salt = profile.encryption_salt.as_deref().ok_or_else(|| {
+        SyncError::InvalidData("Encryption salt missing on encrypted profile".to_string())
+      })?;
+      let key = encryption::derive_profile_key(&password, salt)
+        .map_err(|e| SyncError::InvalidData(format!("Key derivation failed: {e}")))?;
+      Some(key)
+    } else {
+      None
     };
 
     // Ensure profile directory exists
@@ -837,14 +1151,41 @@ impl SyncEngine {
     })?;
 
     // Download all files from manifest
+    let total_size: u64 = manifest.files.iter().map(|f| f.size).sum();
+    log::info!(
+      "Profile {} recovery: downloading {} files ({} bytes total)",
+      profile_id,
+      manifest.files.len(),
+      total_size
+    );
+    for file in &manifest.files {
+      log::info!(
+        "  -> {} ({} bytes, hash: {})",
+        file.path,
+        file.size,
+        file.hash
+      );
+    }
     if !manifest.files.is_empty() {
       self
-        .download_profile_files(app_handle, profile_id, &profile_dir, &manifest.files)
+        .download_profile_files(
+          app_handle,
+          profile_id,
+          &profile_dir,
+          &manifest.files,
+          encryption_key.as_ref(),
+        )
         .await?;
     }
 
-    // Set sync enabled and save profile
-    profile.sync_enabled = true;
+    // Set sync mode and save profile
+    if profile.sync_mode == SyncMode::Disabled {
+      profile.sync_mode = if manifest.encrypted {
+        SyncMode::Encrypted
+      } else {
+        SyncMode::Regular
+      };
+    }
     profile.last_sync = Some(
       std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -928,7 +1269,163 @@ impl SyncEngine {
       log::info!("No missing profiles found");
     }
 
+    // Refresh metadata for local cross-OS profiles (propagate renames, tags, notes from originating device)
+    let profile_manager = ProfileManager::instance();
+    // Collect cross-OS profiles before async operations to avoid holding non-Send Result across await
+    let cross_os_profiles: Vec<(String, SyncMode)> = profile_manager
+      .list_profiles()
+      .unwrap_or_default()
+      .iter()
+      .filter(|p| p.is_cross_os() && p.is_sync_enabled())
+      .map(|p| (p.id.to_string(), p.sync_mode))
+      .collect();
+
+    if !cross_os_profiles.is_empty() {
+      for (pid, sync_mode) in &cross_os_profiles {
+        let metadata_key = format!("profiles/{}/metadata.json", pid);
+        match self.client.stat(&metadata_key).await {
+          Ok(stat) if stat.exists => match self.client.presign_download(&metadata_key).await {
+            Ok(presign) => match self.client.download_bytes(&presign.url).await {
+              Ok(data) => {
+                if let Ok(mut remote_profile) = serde_json::from_slice::<BrowserProfile>(&data) {
+                  remote_profile.sync_mode = *sync_mode;
+                  remote_profile.last_sync = Some(
+                    std::time::SystemTime::now()
+                      .duration_since(std::time::UNIX_EPOCH)
+                      .unwrap()
+                      .as_secs(),
+                  );
+                  if let Err(e) = profile_manager.save_profile(&remote_profile) {
+                    log::warn!("Failed to refresh cross-OS profile {} metadata: {}", pid, e);
+                  } else {
+                    log::debug!("Refreshed cross-OS profile {} metadata", pid);
+                  }
+                }
+              }
+              Err(e) => {
+                log::warn!(
+                  "Failed to download cross-OS profile {} metadata: {}",
+                  pid,
+                  e
+                );
+              }
+            },
+            Err(e) => {
+              log::warn!("Failed to presign cross-OS profile {} metadata: {}", pid, e);
+            }
+          },
+          _ => {}
+        }
+      }
+      let _ = events::emit("profiles-changed", ());
+    }
+
     Ok(downloaded)
+  }
+
+  /// Check for remote entities (proxies, groups, VPNs) not present locally and download them
+  pub async fn check_for_missing_synced_entities(
+    &self,
+    app_handle: &tauri::AppHandle,
+  ) -> SyncResult<()> {
+    log::info!("Checking for missing synced entities...");
+
+    // Check for remote proxies not present locally
+    let remote_proxies = self.client.list("proxies/").await?;
+    for obj in &remote_proxies.objects {
+      if let Some(proxy_id) = obj
+        .key
+        .strip_prefix("proxies/")
+        .and_then(|s| s.strip_suffix(".json"))
+      {
+        let exists_locally = crate::proxy_manager::PROXY_MANAGER
+          .get_stored_proxies()
+          .iter()
+          .any(|p| p.id == proxy_id);
+        if !exists_locally {
+          let tombstone_key = format!("tombstones/proxies/{}.json", proxy_id);
+          if let Ok(stat) = self.client.stat(&tombstone_key).await {
+            if stat.exists {
+              continue;
+            }
+          }
+          log::info!(
+            "Proxy {} exists remotely but not locally, downloading...",
+            proxy_id
+          );
+          if let Err(e) = self.download_proxy(proxy_id, Some(app_handle)).await {
+            log::warn!("Failed to download missing proxy {}: {}", proxy_id, e);
+          }
+        }
+      }
+    }
+
+    // Check for remote groups not present locally
+    let remote_groups = self.client.list("groups/").await?;
+    for obj in &remote_groups.objects {
+      if let Some(group_id) = obj
+        .key
+        .strip_prefix("groups/")
+        .and_then(|s| s.strip_suffix(".json"))
+      {
+        let exists_locally = {
+          let group_manager = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+          group_manager
+            .get_all_groups()
+            .unwrap_or_default()
+            .iter()
+            .any(|g| g.id == group_id)
+        };
+        if !exists_locally {
+          let tombstone_key = format!("tombstones/groups/{}.json", group_id);
+          if let Ok(stat) = self.client.stat(&tombstone_key).await {
+            if stat.exists {
+              continue;
+            }
+          }
+          log::info!(
+            "Group {} exists remotely but not locally, downloading...",
+            group_id
+          );
+          if let Err(e) = self.download_group(group_id, Some(app_handle)).await {
+            log::warn!("Failed to download missing group {}: {}", group_id, e);
+          }
+        }
+      }
+    }
+
+    // Check for remote VPNs not present locally
+    let remote_vpns = self.client.list("vpns/").await?;
+    for obj in &remote_vpns.objects {
+      if let Some(vpn_id) = obj
+        .key
+        .strip_prefix("vpns/")
+        .and_then(|s| s.strip_suffix(".json"))
+      {
+        let exists_locally = {
+          let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+          storage.load_config(vpn_id).is_ok()
+        };
+        if !exists_locally {
+          let tombstone_key = format!("tombstones/vpns/{}.json", vpn_id);
+          if let Ok(stat) = self.client.stat(&tombstone_key).await {
+            if stat.exists {
+              continue;
+            }
+          }
+          log::info!(
+            "VPN {} exists remotely but not locally, downloading...",
+            vpn_id
+          );
+          if let Err(e) = self.download_vpn(vpn_id, Some(app_handle)).await {
+            log::warn!("Failed to download missing VPN {}: {}", vpn_id, e);
+          }
+        }
+      }
+    }
+
+    log::info!("Missing synced entities check complete");
+    Ok(())
   }
 }
 
@@ -938,7 +1435,7 @@ pub fn is_proxy_used_by_synced_profile(proxy_id: &str) -> bool {
   if let Ok(profiles) = profile_manager.list_profiles() {
     profiles
       .iter()
-      .any(|p| p.sync_enabled && p.proxy_id.as_deref() == Some(proxy_id))
+      .any(|p| p.is_sync_enabled() && p.proxy_id.as_deref() == Some(proxy_id))
   } else {
     false
   }
@@ -950,7 +1447,7 @@ pub fn is_group_used_by_synced_profile(group_id: &str) -> bool {
   if let Ok(profiles) = profile_manager.list_profiles() {
     profiles
       .iter()
-      .any(|p| p.sync_enabled && p.group_id.as_deref() == Some(group_id))
+      .any(|p| p.is_sync_enabled() && p.group_id.as_deref() == Some(group_id))
   } else {
     false
   }
@@ -980,6 +1477,43 @@ pub async fn enable_proxy_sync_if_needed(
 
     let _ = events::emit("stored-proxies-changed", ());
     log::info!("Auto-enabled sync for proxy {}", proxy_id);
+  }
+
+  Ok(())
+}
+
+/// Check if VPN is used by any synced profile
+pub fn is_vpn_used_by_synced_profile(vpn_id: &str) -> bool {
+  let profile_manager = ProfileManager::instance();
+  if let Ok(profiles) = profile_manager.list_profiles() {
+    profiles
+      .iter()
+      .any(|p| p.is_sync_enabled() && p.vpn_id.as_deref() == Some(vpn_id))
+  } else {
+    false
+  }
+}
+
+/// Enable sync for VPN if not already enabled
+pub async fn enable_vpn_sync_if_needed(
+  vpn_id: &str,
+  _app_handle: &tauri::AppHandle,
+) -> Result<(), String> {
+  let vpn = {
+    let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+    storage
+      .load_config(vpn_id)
+      .map_err(|e| format!("VPN with ID '{vpn_id}' not found: {e}"))?
+  };
+
+  if !vpn.sync_enabled {
+    let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+    storage
+      .update_sync_fields(vpn_id, true, None)
+      .map_err(|e| format!("Failed to enable VPN sync: {e}"))?;
+
+    let _ = events::emit("vpn-configs-changed", ());
+    log::info!("Auto-enabled sync for VPN {}", vpn_id);
   }
 
   Ok(())
@@ -1019,11 +1553,18 @@ pub async fn enable_group_sync_if_needed(
 }
 
 #[tauri::command]
-pub async fn set_profile_sync_enabled(
+pub async fn set_profile_sync_mode(
   app_handle: tauri::AppHandle,
   profile_id: String,
-  enabled: bool,
+  sync_mode: String,
 ) -> Result<(), String> {
+  let new_mode = match sync_mode.as_str() {
+    "Disabled" => SyncMode::Disabled,
+    "Regular" => SyncMode::Regular,
+    "Encrypted" => SyncMode::Encrypted,
+    _ => return Err(format!("Invalid sync mode: {sync_mode}")),
+  };
+
   let profile_manager = ProfileManager::instance();
   let profiles = profile_manager
     .list_profiles()
@@ -1036,44 +1577,81 @@ pub async fn set_profile_sync_enabled(
     .find(|p| p.id == profile_uuid)
     .ok_or_else(|| format!("Profile with ID '{profile_id}' not found"))?;
 
-  // If enabling, first check that sync settings are configured
-  if enabled {
-    let manager = SettingsManager::instance();
-    let settings = manager
-      .load_settings()
-      .map_err(|e| format!("Failed to load settings: {e}"))?;
+  if profile.is_cross_os() {
+    return Err("Cannot modify sync settings for a cross-OS profile".to_string());
+  }
 
-    if settings.sync_server_url.is_none() {
-      let _ = events::emit(
-        "profile-sync-status",
-        serde_json::json!({
-          "profile_id": profile_id,
-          "status": "error",
-          "error": "Sync server not configured. Please configure sync settings first."
-        }),
-      );
-      return Err("Sync server not configured. Please configure sync settings first.".to_string());
-    }
+  if profile.ephemeral {
+    return Err("Cannot enable sync for an ephemeral profile".to_string());
+  }
 
-    let token = manager.get_sync_token(&app_handle).await.ok().flatten();
-    if token.is_none() {
-      let _ = events::emit(
-        "profile-sync-status",
-        serde_json::json!({
-          "profile_id": profile_id,
-          "status": "error",
-          "error": "Sync token not configured. Please configure sync settings first."
-        }),
-      );
-      return Err("Sync token not configured. Please configure sync settings first.".to_string());
+  let old_mode = profile.sync_mode;
+  let enabling = new_mode != SyncMode::Disabled;
+
+  if enabling {
+    let cloud_logged_in = crate::cloud_auth::CLOUD_AUTH.is_logged_in().await;
+
+    if !cloud_logged_in {
+      let manager = SettingsManager::instance();
+      let settings = manager
+        .load_settings()
+        .map_err(|e| format!("Failed to load settings: {e}"))?;
+
+      if settings.sync_server_url.is_none() {
+        let _ = events::emit(
+          "profile-sync-status",
+          serde_json::json!({
+            "profile_id": profile_id,
+            "status": "error",
+            "error": "Sync server not configured. Please configure sync settings first."
+          }),
+        );
+        return Err(
+          "Sync server not configured. Please configure sync settings first.".to_string(),
+        );
+      }
+
+      let token = manager.get_sync_token(&app_handle).await.ok().flatten();
+      if token.is_none() {
+        let _ = events::emit(
+          "profile-sync-status",
+          serde_json::json!({
+            "profile_id": profile_id,
+            "status": "error",
+            "error": "Sync token not configured. Please configure sync settings first."
+          }),
+        );
+        return Err("Sync token not configured. Please configure sync settings first.".to_string());
+      }
     }
   }
 
-  profile.sync_enabled = enabled;
-
-  if !enabled {
-    profile.last_sync = None;
+  // If switching to Encrypted, verify password and generate salt
+  if new_mode == SyncMode::Encrypted {
+    if !encryption::has_e2e_password() {
+      return Err("E2E password not set. Please set a password in Settings first.".to_string());
+    }
+    if profile.encryption_salt.is_none() {
+      profile.encryption_salt = Some(encryption::generate_salt());
+    }
   }
+
+  // If switching between Regular<->Encrypted, delete remote manifest to force full re-upload
+  let mode_switched = old_mode != SyncMode::Disabled && enabling && old_mode != new_mode;
+  if mode_switched {
+    if let Ok(engine) = SyncEngine::create_from_settings(&app_handle).await {
+      let manifest_key = format!("profiles/{}/manifest.json", profile_id);
+      let _ = engine.client.delete(&manifest_key, None).await;
+      log::info!(
+        "Deleted remote manifest for profile {} due to sync mode change ({:?} -> {:?})",
+        profile_id,
+        old_mode,
+        new_mode
+      );
+    }
+  }
+
+  profile.sync_mode = new_mode;
 
   profile_manager
     .save_profile(&profile)
@@ -1081,8 +1659,7 @@ pub async fn set_profile_sync_enabled(
 
   let _ = events::emit("profiles-changed", ());
 
-  if enabled {
-    // Check if profile is running to determine status
+  if enabling {
     let is_running = profile.process_id.is_some();
 
     let _ = events::emit(
@@ -1093,13 +1670,11 @@ pub async fn set_profile_sync_enabled(
       }),
     );
 
-    // Queue sync via scheduler (not direct sync)
     if let Some(scheduler) = super::get_global_scheduler() {
       scheduler
         .queue_profile_sync_immediate(profile_id.clone())
         .await;
 
-      // Auto-enable sync for proxy and group if they exist
       if let Some(ref proxy_id) = profile.proxy_id {
         if let Err(e) = enable_proxy_sync_if_needed(proxy_id, &app_handle).await {
           log::warn!("Failed to enable sync for proxy {}: {}", proxy_id, e);
@@ -1114,10 +1689,41 @@ pub async fn set_profile_sync_enabled(
           scheduler.queue_group_sync(group_id.clone()).await;
         }
       }
+      if let Some(ref vpn_id) = profile.vpn_id {
+        if let Err(e) = enable_vpn_sync_if_needed(vpn_id, &app_handle).await {
+          log::warn!("Failed to enable sync for VPN {}: {}", vpn_id, e);
+        } else {
+          scheduler.queue_vpn_sync(vpn_id.clone()).await;
+        }
+      }
     } else {
       log::warn!("Scheduler not initialized, sync will not start");
     }
   } else {
+    // Delete remote data when disabling sync
+    if old_mode != SyncMode::Disabled {
+      let profile_id_clone = profile_id.clone();
+      let app_handle_clone = app_handle.clone();
+      tokio::spawn(async move {
+        match SyncEngine::create_from_settings(&app_handle_clone).await {
+          Ok(engine) => {
+            if let Err(e) = engine.delete_profile(&profile_id_clone).await {
+              log::warn!(
+                "Failed to delete profile {} from sync: {}",
+                profile_id_clone,
+                e
+              );
+            } else {
+              log::info!("Profile {} deleted from sync service", profile_id_clone);
+            }
+          }
+          Err(e) => {
+            log::debug!("Sync not configured, skipping remote deletion: {}", e);
+          }
+        }
+      });
+    }
+
     let _ = events::emit(
       "profile-sync-status",
       serde_json::json!({
@@ -1125,6 +1731,22 @@ pub async fn set_profile_sync_enabled(
         "status": "disabled"
       }),
     );
+  }
+
+  if crate::cloud_auth::CLOUD_AUTH.is_logged_in().await {
+    let sync_count = profile_manager
+      .list_profiles()
+      .map(|profiles| profiles.iter().filter(|p| p.is_sync_enabled()).count())
+      .unwrap_or(0);
+
+    tokio::spawn(async move {
+      if let Err(e) = crate::cloud_auth::CLOUD_AUTH
+        .report_sync_profile_count(sync_count as i64)
+        .await
+      {
+        log::warn!("Failed to report sync profile count: {e}");
+      }
+    });
   }
 
   Ok(())
@@ -1148,7 +1770,7 @@ pub async fn request_profile_sync(
     .find(|p| p.id == profile_uuid)
     .ok_or_else(|| format!("Profile with ID '{profile_id}' not found"))?;
 
-  if !profile.sync_enabled {
+  if !profile.is_sync_enabled() {
     return Err("Sync is not enabled for this profile".to_string());
   }
 
@@ -1216,6 +1838,11 @@ pub async fn set_proxy_sync_enabled(
     .find(|p| p.id == proxy_id)
     .ok_or_else(|| format!("Proxy with ID '{proxy_id}' not found"))?;
 
+  // Block modifying sync for cloud-managed proxies
+  if proxy.is_cloud_managed {
+    return Err("Cannot modify sync for a cloud-managed proxy".to_string());
+  }
+
   // If disabling, check if proxy is used by any synced profile
   if !enabled && is_proxy_used_by_synced_profile(&proxy_id) {
     return Err("Sync cannot be disabled while this proxy is used by synced profiles".to_string());
@@ -1223,18 +1850,24 @@ pub async fn set_proxy_sync_enabled(
 
   // If enabling, check that sync settings are configured
   if enabled {
-    let manager = SettingsManager::instance();
-    let settings = manager
-      .load_settings()
-      .map_err(|e| format!("Failed to load settings: {e}"))?;
+    let cloud_logged_in = crate::cloud_auth::CLOUD_AUTH.is_logged_in().await;
 
-    if settings.sync_server_url.is_none() {
-      return Err("Sync server not configured. Please configure sync settings first.".to_string());
-    }
+    if !cloud_logged_in {
+      let manager = SettingsManager::instance();
+      let settings = manager
+        .load_settings()
+        .map_err(|e| format!("Failed to load settings: {e}"))?;
 
-    let token = manager.get_sync_token(&app_handle).await.ok().flatten();
-    if token.is_none() {
-      return Err("Sync token not configured. Please configure sync settings first.".to_string());
+      if settings.sync_server_url.is_none() {
+        return Err(
+          "Sync server not configured. Please configure sync settings first.".to_string(),
+        );
+      }
+
+      let token = manager.get_sync_token(&app_handle).await.ok().flatten();
+      if token.is_none() {
+        return Err("Sync token not configured. Please configure sync settings first.".to_string());
+      }
     }
   }
 
@@ -1301,18 +1934,24 @@ pub async fn set_group_sync_enabled(
 
   // If enabling, check that sync settings are configured
   if enabled {
-    let manager = SettingsManager::instance();
-    let settings = manager
-      .load_settings()
-      .map_err(|e| format!("Failed to load settings: {e}"))?;
+    let cloud_logged_in = crate::cloud_auth::CLOUD_AUTH.is_logged_in().await;
 
-    if settings.sync_server_url.is_none() {
-      return Err("Sync server not configured. Please configure sync settings first.".to_string());
-    }
+    if !cloud_logged_in {
+      let manager = SettingsManager::instance();
+      let settings = manager
+        .load_settings()
+        .map_err(|e| format!("Failed to load settings: {e}"))?;
 
-    let token = manager.get_sync_token(&app_handle).await.ok().flatten();
-    if token.is_none() {
-      return Err("Sync token not configured. Please configure sync settings first.".to_string());
+      if settings.sync_server_url.is_none() {
+        return Err(
+          "Sync server not configured. Please configure sync settings first.".to_string(),
+        );
+      }
+
+      let token = manager.get_sync_token(&app_handle).await.ok().flatten();
+      if token.is_none() {
+        return Err("Sync token not configured. Please configure sync settings first.".to_string());
+      }
     }
   }
 
@@ -1365,4 +2004,170 @@ pub fn is_proxy_in_use_by_synced_profile(proxy_id: String) -> bool {
 #[tauri::command]
 pub fn is_group_in_use_by_synced_profile(group_id: String) -> bool {
   is_group_used_by_synced_profile(&group_id)
+}
+
+#[tauri::command]
+pub async fn set_vpn_sync_enabled(
+  app_handle: tauri::AppHandle,
+  vpn_id: String,
+  enabled: bool,
+) -> Result<(), String> {
+  let vpn = {
+    let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+    storage
+      .load_config(&vpn_id)
+      .map_err(|e| format!("VPN with ID '{vpn_id}' not found: {e}"))?
+  };
+
+  // If disabling, check if VPN is used by any synced profile
+  if !enabled && is_vpn_used_by_synced_profile(&vpn_id) {
+    return Err("Sync cannot be disabled while this VPN is used by synced profiles".to_string());
+  }
+
+  // If enabling, check that sync settings are configured
+  if enabled {
+    let cloud_logged_in = crate::cloud_auth::CLOUD_AUTH.is_logged_in().await;
+
+    if !cloud_logged_in {
+      let manager = SettingsManager::instance();
+      let settings = manager
+        .load_settings()
+        .map_err(|e| format!("Failed to load settings: {e}"))?;
+
+      if settings.sync_server_url.is_none() {
+        return Err(
+          "Sync server not configured. Please configure sync settings first.".to_string(),
+        );
+      }
+
+      let token = manager.get_sync_token(&app_handle).await.ok().flatten();
+      if token.is_none() {
+        return Err("Sync token not configured. Please configure sync settings first.".to_string());
+      }
+    }
+  }
+
+  let last_sync = if enabled { vpn.last_sync } else { None };
+
+  {
+    let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+    storage
+      .update_sync_fields(&vpn_id, enabled, last_sync)
+      .map_err(|e| format!("Failed to update VPN sync: {e}"))?;
+  }
+
+  let _ = events::emit("vpn-configs-changed", ());
+
+  if enabled {
+    let _ = events::emit(
+      "vpn-sync-status",
+      serde_json::json!({
+        "id": vpn_id,
+        "status": "syncing"
+      }),
+    );
+
+    if let Some(scheduler) = super::get_global_scheduler() {
+      scheduler.queue_vpn_sync(vpn_id).await;
+    }
+  } else {
+    let _ = events::emit(
+      "vpn-sync-status",
+      serde_json::json!({
+        "id": vpn_id,
+        "status": "disabled"
+      }),
+    );
+  }
+
+  Ok(())
+}
+
+#[tauri::command]
+pub fn is_vpn_in_use_by_synced_profile(vpn_id: String) -> bool {
+  is_vpn_used_by_synced_profile(&vpn_id)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnsyncedEntityCounts {
+  pub proxies: usize,
+  pub groups: usize,
+  pub vpns: usize,
+}
+
+#[tauri::command]
+pub fn get_unsynced_entity_counts() -> Result<UnsyncedEntityCounts, String> {
+  let proxy_count = {
+    let proxies = crate::proxy_manager::PROXY_MANAGER.get_stored_proxies();
+    proxies
+      .iter()
+      .filter(|p| !p.sync_enabled && !p.is_cloud_managed)
+      .count()
+  };
+
+  let group_count = {
+    let gm = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+    let groups = gm
+      .get_all_groups()
+      .map_err(|e| format!("Failed to get groups: {e}"))?;
+    groups.iter().filter(|g| !g.sync_enabled).count()
+  };
+
+  let vpn_count = {
+    let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+    let configs = storage
+      .list_configs()
+      .map_err(|e| format!("Failed to list VPN configs: {e}"))?;
+    configs.iter().filter(|c| !c.sync_enabled).count()
+  };
+
+  Ok(UnsyncedEntityCounts {
+    proxies: proxy_count,
+    groups: group_count,
+    vpns: vpn_count,
+  })
+}
+
+#[tauri::command]
+pub async fn enable_sync_for_all_entities(app_handle: tauri::AppHandle) -> Result<(), String> {
+  // Enable sync for all unsynced proxies
+  {
+    let proxies = crate::proxy_manager::PROXY_MANAGER.get_stored_proxies();
+    for proxy in &proxies {
+      if !proxy.sync_enabled && !proxy.is_cloud_managed {
+        set_proxy_sync_enabled(app_handle.clone(), proxy.id.clone(), true).await?;
+      }
+    }
+  }
+
+  // Enable sync for all unsynced groups
+  {
+    let groups = {
+      let gm = crate::group_manager::GROUP_MANAGER.lock().unwrap();
+      gm.get_all_groups()
+        .map_err(|e| format!("Failed to get groups: {e}"))?
+    };
+    for group in &groups {
+      if !group.sync_enabled {
+        set_group_sync_enabled(app_handle.clone(), group.id.clone(), true).await?;
+      }
+    }
+  }
+
+  // Enable sync for all unsynced VPNs
+  {
+    let configs = {
+      let storage = crate::vpn::VPN_STORAGE.lock().unwrap();
+      storage
+        .list_configs()
+        .map_err(|e| format!("Failed to list VPN configs: {e}"))?
+    };
+    for config in &configs {
+      if !config.sync_enabled {
+        set_vpn_sync_enabled(app_handle.clone(), config.id.clone(), true).await?;
+      }
+    }
+  }
+
+  Ok(())
 }

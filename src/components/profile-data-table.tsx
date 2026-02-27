@@ -13,6 +13,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import type { Dispatch, SetStateAction } from "react";
 import * as React from "react";
+import { useTranslation } from "react-i18next";
+import { FaApple, FaLinux, FaWindows } from "react-icons/fa";
 import { FiWifi } from "react-icons/fi";
 import { IoEllipsisHorizontal } from "react-icons/io5";
 import {
@@ -46,6 +48,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { ProBadge } from "@/components/ui/pro-badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Table,
@@ -63,19 +66,24 @@ import {
 import { useBrowserState } from "@/hooks/use-browser-state";
 import { useProxyEvents } from "@/hooks/use-proxy-events";
 import { useTableSorting } from "@/hooks/use-table-sorting";
+import { useVpnEvents } from "@/hooks/use-vpn-events";
 import {
   getBrowserDisplayName,
-  getBrowserIcon,
   getCurrentOS,
+  getOSDisplayName,
+  getProfileIcon,
+  isCrossOsProfile,
 } from "@/lib/browser-utils";
 import { formatRelativeTime } from "@/lib/flag-utils";
 import { trimName } from "@/lib/name-utils";
 import { cn } from "@/lib/utils";
 import type {
   BrowserProfile,
+  LocationItem,
   ProxyCheckResult,
   StoredProxy,
   TrafficSnapshot,
+  VpnConfig,
 } from "@/types";
 import { BandwidthMiniChart } from "./bandwidth-mini-chart";
 import {
@@ -92,6 +100,7 @@ import { RippleButton } from "./ui/ripple";
 // Stable table meta type to pass volatile state/handlers into TanStack Table without
 // causing column definitions to be recreated on every render.
 type TableMeta = {
+  t: (key: string, options?: Record<string, unknown>) => string;
   selectedProfiles: string[];
   selectableCount: number;
   showCheckboxes: boolean;
@@ -132,6 +141,14 @@ type TableMeta = {
   checkingProfileId: string | null;
   proxyCheckResults: Record<string, ProxyCheckResult>;
 
+  // VPN selector state
+  vpnConfigs: VpnConfig[];
+  vpnOverrides: Record<string, string | null>;
+  handleVpnSelection: (
+    profileId: string,
+    vpnId: string | null,
+  ) => void | Promise<void>;
+
   // Selection helpers
   isProfileSelected: (id: string) => boolean;
   handleToggleAll: (checked: boolean) => void;
@@ -161,16 +178,84 @@ type TableMeta = {
   onConfigureCamoufox?: (profile: BrowserProfile) => void;
   onCloneProfile?: (profile: BrowserProfile) => void;
   onCopyCookiesToProfile?: (profile: BrowserProfile) => void;
+  onOpenCookieManagement?: (profile: BrowserProfile) => void;
 
   // Traffic snapshots (lightweight real-time data)
   trafficSnapshots: Record<string, TrafficSnapshot>;
   onOpenTrafficDialog?: (profileId: string) => void;
 
   // Sync
-  syncStatuses: Record<string, string>;
+  syncStatuses: Record<string, { status: string; error?: string }>;
   onOpenProfileSyncDialog?: (profile: BrowserProfile) => void;
   onToggleProfileSync?: (profile: BrowserProfile) => void;
+  crossOsUnlocked?: boolean;
+  syncUnlocked?: boolean;
+
+  // Country proxy creation (inline in proxy dropdown)
+  countries: LocationItem[];
+  canCreateLocationProxy: boolean;
+  loadCountries: () => Promise<void>;
+  handleCreateCountryProxy: (
+    profileId: string,
+    country: LocationItem,
+  ) => Promise<void>;
 };
+
+type SyncStatusDot = { color: string; tooltip: string; animate: boolean };
+
+function getProfileSyncStatusDot(
+  profile: BrowserProfile,
+  liveStatus:
+    | "syncing"
+    | "waiting"
+    | "synced"
+    | "error"
+    | "disabled"
+    | undefined,
+  errorMessage?: string,
+): SyncStatusDot | null {
+  const status =
+    liveStatus ??
+    (profile.sync_mode && profile.sync_mode !== "Disabled"
+      ? "synced"
+      : "disabled");
+
+  switch (status) {
+    case "syncing":
+      return { color: "bg-yellow-500", tooltip: "Syncing...", animate: true };
+    case "waiting":
+      return {
+        color: "bg-yellow-500",
+        tooltip: "Waiting to sync",
+        animate: false,
+      };
+    case "synced":
+      return {
+        color: "bg-green-500",
+        tooltip: profile.last_sync
+          ? `Synced ${new Date(profile.last_sync * 1000).toLocaleString()}`
+          : "Synced",
+        animate: false,
+      };
+    case "error":
+      return {
+        color: "bg-red-500",
+        tooltip: errorMessage ? `Sync error: ${errorMessage}` : "Sync error",
+        animate: false,
+      };
+    case "disabled":
+      if (profile.last_sync) {
+        return {
+          color: "bg-gray-400",
+          tooltip: `Sync disabled, last sync ${formatRelativeTime(profile.last_sync)}`,
+          animate: false,
+        };
+      }
+      return null;
+    default:
+      return null;
+  }
+}
 
 const TagsCell = React.memo<{
   profile: BrowserProfile;
@@ -678,6 +763,7 @@ interface ProfilesDataTableProps {
   onRenameProfile: (profileId: string, newName: string) => Promise<void>;
   onConfigureCamoufox: (profile: BrowserProfile) => void;
   onCopyCookiesToProfile?: (profile: BrowserProfile) => void;
+  onOpenCookieManagement?: (profile: BrowserProfile) => void;
   runningProfiles: Set<string>;
   isUpdating: (browser: string) => boolean;
   onDeleteSelectedProfiles: (profileIds: string[]) => Promise<void>;
@@ -691,6 +777,8 @@ interface ProfilesDataTableProps {
   onBulkCopyCookies?: () => void;
   onOpenProfileSyncDialog?: (profile: BrowserProfile) => void;
   onToggleProfileSync?: (profile: BrowserProfile) => void;
+  crossOsUnlocked?: boolean;
+  syncUnlocked?: boolean;
 }
 
 export function ProfilesDataTable({
@@ -702,6 +790,7 @@ export function ProfilesDataTable({
   onRenameProfile,
   onConfigureCamoufox,
   onCopyCookiesToProfile,
+  onOpenCookieManagement,
   runningProfiles,
   isUpdating,
   onAssignProfilesToGroup,
@@ -713,7 +802,10 @@ export function ProfilesDataTable({
   onBulkCopyCookies,
   onOpenProfileSyncDialog,
   onToggleProfileSync,
+  crossOsUnlocked = false,
+  syncUnlocked = false,
 }: ProfilesDataTableProps) {
+  const { t } = useTranslation();
   const { getTableSorting, updateSorting, isLoaded } = useTableSorting();
   const [sorting, setSorting] = React.useState<SortingState>([]);
 
@@ -784,8 +876,12 @@ export function ProfilesDataTable({
   );
 
   const { storedProxies } = useProxyEvents();
+  const { vpnConfigs } = useVpnEvents();
 
   const [proxyOverrides, setProxyOverrides] = React.useState<
+    Record<string, string | null>
+  >({});
+  const [vpnOverrides, setVpnOverrides] = React.useState<
     Record<string, string | null>
   >({});
   const [showCheckboxes, setShowCheckboxes] = React.useState(false);
@@ -819,8 +915,25 @@ export function ProfilesDataTable({
     name?: string;
   } | null>(null);
   const [syncStatuses, setSyncStatuses] = React.useState<
-    Record<string, string>
+    Record<string, { status: string; error?: string }>
   >({});
+
+  // Country proxy creation state (for inline proxy creation in dropdown)
+  const [countries, setCountries] = React.useState<LocationItem[]>([]);
+  const [countriesLoaded, setCountriesLoaded] = React.useState(false);
+  const hasCloudProxy = storedProxies.some((p) => p.is_cloud_managed);
+  const canCreateLocationProxy = hasCloudProxy || crossOsUnlocked;
+
+  const loadCountries = React.useCallback(async () => {
+    if (countriesLoaded || !canCreateLocationProxy) return;
+    try {
+      const data = await invoke<LocationItem[]>("cloud_get_countries");
+      setCountries(data);
+      setCountriesLoaded(true);
+    } catch (e) {
+      console.error("Failed to load countries:", e);
+    }
+  }, [countriesLoaded, canCreateLocationProxy]);
 
   // Load cached check results for proxies
   React.useEffect(() => {
@@ -869,7 +982,7 @@ export function ProfilesDataTable({
           proxyId,
         });
         setProxyOverrides((prev) => ({ ...prev, [profileId]: proxyId }));
-        // Notify other parts of the app so usage counts and lists refresh
+        setVpnOverrides((prev) => ({ ...prev, [profileId]: null }));
         await emit("profile-updated");
       } catch (error) {
         console.error("Failed to update proxy settings:", error);
@@ -878,6 +991,54 @@ export function ProfilesDataTable({
       }
     },
     [],
+  );
+
+  const handleVpnSelection = React.useCallback(
+    async (profileId: string, vpnId: string | null) => {
+      try {
+        await invoke("update_profile_vpn", {
+          profileId,
+          vpnId,
+        });
+        setVpnOverrides((prev) => ({ ...prev, [profileId]: vpnId }));
+        setProxyOverrides((prev) => ({ ...prev, [profileId]: null }));
+        await emit("profile-updated");
+      } catch (error) {
+        console.error("Failed to update VPN settings:", error);
+      } finally {
+        setOpenProxySelectorFor(null);
+      }
+    },
+    [],
+  );
+
+  const handleCreateCountryProxy = React.useCallback(
+    async (profileId: string, country: LocationItem) => {
+      try {
+        await invoke("create_cloud_location_proxy", {
+          name: country.name,
+          country: country.code,
+          state: null,
+          city: null,
+        });
+        await emit("stored-proxies-changed");
+        // Wait briefly for proxy list to update, then find and assign the new proxy
+        await new Promise((r) => setTimeout(r, 200));
+        const updatedProxies =
+          await invoke<StoredProxy[]>("get_stored_proxies");
+        const newProxy = updatedProxies.find(
+          (p: StoredProxy) =>
+            p.is_cloud_derived && p.geo_country === country.code,
+        );
+        if (newProxy) {
+          await handleProxySelection(profileId, newProxy.id);
+        }
+        setOpenProxySelectorFor(null);
+      } catch (error) {
+        console.error("Failed to create country proxy:", error);
+      }
+    },
+    [handleProxySelection],
   );
 
   // Use shared browser state hook
@@ -895,13 +1056,17 @@ export function ProfilesDataTable({
     let unlisten: (() => void) | undefined;
     (async () => {
       try {
-        unlisten = await listen<{ profile_id: string; status: string }>(
-          "profile-sync-status",
-          (event) => {
-            const { profile_id, status } = event.payload;
-            setSyncStatuses((prev) => ({ ...prev, [profile_id]: status }));
-          },
-        );
+        unlisten = await listen<{
+          profile_id: string;
+          status: string;
+          error?: string;
+        }>("profile-sync-status", (event) => {
+          const { profile_id, status, error } = event.payload;
+          setSyncStatuses((prev) => ({
+            ...prev,
+            [profile_id]: { status, error },
+          }));
+        });
       } catch (error) {
         console.error("Failed to listen for sync status events:", error);
       }
@@ -1040,9 +1205,8 @@ export function ProfilesDataTable({
           browserState.isClient && runningProfiles.has(profile.id);
         const isLaunching = launchingProfiles.has(profile.id);
         const isStopping = stoppingProfiles.has(profile.id);
-        const isBrowserUpdating = isUpdating(profile.browser);
 
-        if (isRunning || isLaunching || isStopping || isBrowserUpdating) {
+        if (isRunning || isLaunching || isStopping) {
           newSet.delete(profileId);
           hasChanges = true;
         }
@@ -1057,7 +1221,6 @@ export function ProfilesDataTable({
     runningProfiles,
     launchingProfiles,
     stoppingProfiles,
-    isUpdating,
     browserState.isClient,
     onSelectedProfilesChange,
     selectedProfiles,
@@ -1163,12 +1326,7 @@ export function ProfilesDataTable({
 
       onSelectedProfilesChange(Array.from(newSet));
     },
-    [
-      profiles,
-      browserState.canSelectProfile,
-      onSelectedProfilesChange,
-      selectedProfiles,
-    ],
+    [profiles, browserState, onSelectedProfilesChange, selectedProfiles],
   );
 
   React.useEffect(() => {
@@ -1208,13 +1366,7 @@ export function ProfilesDataTable({
                   browserState.isClient && runningProfiles.has(profile.id);
                 const isLaunching = launchingProfiles.has(profile.id);
                 const isStopping = stoppingProfiles.has(profile.id);
-                const isBrowserUpdating = isUpdating(profile.browser);
-                return (
-                  !isRunning &&
-                  !isLaunching &&
-                  !isStopping &&
-                  !isBrowserUpdating
-                );
+                return !isRunning && !isLaunching && !isStopping;
               })
               .map((profile) => profile.id),
           )
@@ -1230,7 +1382,6 @@ export function ProfilesDataTable({
       runningProfiles,
       launchingProfiles,
       stoppingProfiles,
-      isUpdating,
     ],
   );
 
@@ -1241,8 +1392,7 @@ export function ProfilesDataTable({
         browserState.isClient && runningProfiles.has(profile.id);
       const isLaunching = launchingProfiles.has(profile.id);
       const isStopping = stoppingProfiles.has(profile.id);
-      const isBrowserUpdating = isUpdating(profile.browser);
-      return !isRunning && !isLaunching && !isStopping && !isBrowserUpdating;
+      return !isRunning && !isLaunching && !isStopping;
     });
   }, [
     profiles,
@@ -1250,12 +1400,12 @@ export function ProfilesDataTable({
     runningProfiles,
     launchingProfiles,
     stoppingProfiles,
-    isUpdating,
   ]);
 
   // Build table meta from volatile state so columns can stay stable
   const tableMeta = React.useMemo<TableMeta>(
     () => ({
+      t,
       selectedProfiles,
       selectableCount: selectableProfiles.length,
       showCheckboxes,
@@ -1289,6 +1439,11 @@ export function ProfilesDataTable({
       checkingProfileId,
       proxyCheckResults,
 
+      // VPN selector state
+      vpnConfigs,
+      vpnOverrides,
+      handleVpnSelection,
+
       // Selection helpers
       isProfileSelected: (id: string) => selectedProfiles.includes(id),
       handleToggleAll,
@@ -1316,6 +1471,7 @@ export function ProfilesDataTable({
       onCloneProfile,
       onConfigureCamoufox,
       onCopyCookiesToProfile,
+      onOpenCookieManagement,
 
       // Traffic snapshots (lightweight real-time data)
       trafficSnapshots,
@@ -1328,8 +1484,17 @@ export function ProfilesDataTable({
       syncStatuses,
       onOpenProfileSyncDialog,
       onToggleProfileSync,
+      crossOsUnlocked,
+      syncUnlocked,
+
+      // Country proxy creation
+      countries,
+      canCreateLocationProxy,
+      loadCountries,
+      handleCreateCountryProxy,
     }),
     [
+      t,
       selectedProfiles,
       selectableProfiles.length,
       showCheckboxes,
@@ -1350,6 +1515,9 @@ export function ProfilesDataTable({
       handleProxySelection,
       checkingProfileId,
       proxyCheckResults,
+      vpnConfigs,
+      vpnOverrides,
+      handleVpnSelection,
       handleToggleAll,
       handleCheckboxChange,
       handleIconClick,
@@ -1366,9 +1534,16 @@ export function ProfilesDataTable({
       onCloneProfile,
       onConfigureCamoufox,
       onCopyCookiesToProfile,
+      onOpenCookieManagement,
       syncStatuses,
       onOpenProfileSyncDialog,
       onToggleProfileSync,
+      crossOsUnlocked,
+      syncUnlocked,
+      countries,
+      canCreateLocationProxy,
+      loadCountries,
+      handleCreateCountryProxy,
     ],
   );
 
@@ -1396,16 +1571,83 @@ export function ProfilesDataTable({
           const meta = table.options.meta as TableMeta;
           const profile = row.original;
           const browser = profile.browser;
-          const IconComponent = getBrowserIcon(browser);
+          const IconComponent = getProfileIcon(profile);
+          const isCrossOs = isCrossOsProfile(profile);
 
           const isSelected = meta.isProfileSelected(profile.id);
           const isRunning =
             meta.isClient && meta.runningProfiles.has(profile.id);
           const isLaunching = meta.launchingProfiles.has(profile.id);
           const isStopping = meta.stoppingProfiles.has(profile.id);
-          const isBrowserUpdating = meta.isUpdating(browser);
-          const isDisabled =
-            isRunning || isLaunching || isStopping || isBrowserUpdating;
+          const isDisabled = isRunning || isLaunching || isStopping;
+
+          // Cross-OS profiles: show OS icon when checkboxes aren't visible, show checkbox when they are
+          if (isCrossOs && !meta.showCheckboxes && !isSelected) {
+            const osName = profile.host_os
+              ? getOSDisplayName(profile.host_os)
+              : "another OS";
+            const OsIcon =
+              profile.host_os === "macos"
+                ? FaApple
+                : profile.host_os === "windows"
+                  ? FaWindows
+                  : FaLinux;
+            return (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="flex justify-center items-center w-4 h-4">
+                    <button
+                      type="button"
+                      className="flex justify-center items-center p-0 border-none cursor-pointer"
+                      onClick={() => meta.handleIconClick(profile.id)}
+                      aria-label="Select profile"
+                    >
+                      <span className="w-4 h-4 group">
+                        <OsIcon className="w-4 h-4 text-muted-foreground group-hover:hidden" />
+                        <span className="peer border-input dark:bg-input/30 dark:data-[state=checked]:bg-primary size-4 shrink-0 rounded-[4px] border shadow-xs transition-shadow outline-none w-4 h-4 hidden group-hover:block pointer-events-none items-center justify-center duration-200" />
+                      </span>
+                    </button>
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>
+                    This profile was created on {osName} and is not supported on
+                    this system
+                  </p>
+                </TooltipContent>
+              </Tooltip>
+            );
+          }
+
+          // Cross-OS profiles with checkboxes visible: show checkbox (selectable for bulk delete)
+          if (isCrossOs && (meta.showCheckboxes || isSelected)) {
+            const osName = profile.host_os
+              ? getOSDisplayName(profile.host_os)
+              : "another OS";
+            return (
+              <NonHoverableTooltip
+                content={
+                  <p>
+                    This profile was created on {osName} and is not supported on
+                    this system
+                  </p>
+                }
+                sideOffset={4}
+                horizontalOffset={8}
+              >
+                <span className="flex justify-center items-center w-4 h-4">
+                  <Checkbox
+                    checked={isSelected}
+                    onCheckedChange={(value) =>
+                      meta.handleCheckboxChange(profile.id, !!value)
+                    }
+                    aria-label="Select row"
+                    className="w-4 h-4"
+                  />
+                </span>
+              </NonHoverableTooltip>
+            );
+          }
 
           if (isDisabled) {
             const tooltipMessage = isRunning
@@ -1651,13 +1893,13 @@ export function ProfilesDataTable({
               </Tooltip>
             );
 
+          const isCrossOs = isCrossOsProfile(profile);
           const isRunning =
             meta.isClient && meta.runningProfiles.has(profile.id);
           const isLaunching = meta.launchingProfiles.has(profile.id);
           const isStopping = meta.stoppingProfiles.has(profile.id);
-          const isBrowserUpdating = meta.isUpdating(profile.browser);
           const isDisabled =
-            isRunning || isLaunching || isStopping || isBrowserUpdating;
+            isRunning || isLaunching || isStopping || isCrossOs;
 
           return (
             <button
@@ -1695,13 +1937,13 @@ export function ProfilesDataTable({
         cell: ({ row, table }) => {
           const meta = table.options.meta as TableMeta;
           const profile = row.original;
+          const isCrossOs = isCrossOsProfile(profile);
           const isRunning =
             meta.isClient && meta.runningProfiles.has(profile.id);
           const isLaunching = meta.launchingProfiles.has(profile.id);
           const isStopping = meta.stoppingProfiles.has(profile.id);
-          const isBrowserUpdating = meta.isUpdating(profile.browser);
           const isDisabled =
-            isRunning || isLaunching || isStopping || isBrowserUpdating;
+            isRunning || isLaunching || isStopping || isCrossOs;
 
           return (
             <TagsCell
@@ -1723,13 +1965,13 @@ export function ProfilesDataTable({
         cell: ({ row, table }) => {
           const meta = table.options.meta as TableMeta;
           const profile = row.original;
+          const isCrossOs = isCrossOsProfile(profile);
           const isRunning =
             meta.isClient && meta.runningProfiles.has(profile.id);
           const isLaunching = meta.launchingProfiles.has(profile.id);
           const isStopping = meta.stoppingProfiles.has(profile.id);
-          const isBrowserUpdating = meta.isUpdating(profile.browser);
           const isDisabled =
-            isRunning || isLaunching || isStopping || isBrowserUpdating;
+            isRunning || isLaunching || isStopping || isCrossOs;
 
           return (
             <NoteCell
@@ -1745,40 +1987,56 @@ export function ProfilesDataTable({
       },
       {
         id: "proxy",
-        header: "Proxy",
+        header: "Proxy / VPN",
         cell: ({ row, table }) => {
           const meta = table.options.meta as TableMeta;
           const profile = row.original;
+          const isCrossOs = isCrossOsProfile(profile);
           const isRunning =
             meta.isClient && meta.runningProfiles.has(profile.id);
           const isLaunching = meta.launchingProfiles.has(profile.id);
           const isStopping = meta.stoppingProfiles.has(profile.id);
-          const isBrowserUpdating = meta.isUpdating(profile.browser);
           const isDisabled =
-            isRunning || isLaunching || isStopping || isBrowserUpdating;
+            isRunning || isLaunching || isStopping || isCrossOs;
 
-          const hasOverride = Object.hasOwn(meta.proxyOverrides, profile.id);
-          const effectiveProxyId = hasOverride
+          const hasProxyOverride = Object.hasOwn(
+            meta.proxyOverrides,
+            profile.id,
+          );
+          const effectiveProxyId = hasProxyOverride
             ? meta.proxyOverrides[profile.id]
             : (profile.proxy_id ?? null);
           const effectiveProxy = effectiveProxyId
             ? (meta.storedProxies.find((p) => p.id === effectiveProxyId) ??
               null)
             : null;
-          const displayName = effectiveProxy
-            ? effectiveProxy.name
-            : "Not Selected";
-          const profileHasProxy = Boolean(effectiveProxy);
-          const tooltipText =
-            profileHasProxy && effectiveProxy ? effectiveProxy.name : null;
+
+          const hasVpnOverride = Object.hasOwn(meta.vpnOverrides, profile.id);
+          const effectiveVpnId = hasVpnOverride
+            ? meta.vpnOverrides[profile.id]
+            : (profile.vpn_id ?? null);
+          const effectiveVpn = effectiveVpnId
+            ? (meta.vpnConfigs.find((v) => v.id === effectiveVpnId) ?? null)
+            : null;
+
+          const hasAssignment = Boolean(effectiveProxy || effectiveVpn);
+          const displayName = effectiveVpn
+            ? effectiveVpn.name
+            : effectiveProxy
+              ? effectiveProxy.name
+              : "Not Selected";
+          const vpnBadge = effectiveVpn
+            ? effectiveVpn.vpn_type === "WireGuard"
+              ? "WG"
+              : "OVPN"
+            : null;
+          const tooltipText = hasAssignment ? displayName : null;
           const isSelectorOpen = meta.openProxySelectorFor === profile.id;
+          const selectedId = effectiveVpnId ?? effectiveProxyId ?? null;
 
           // When profile is running, show bandwidth chart instead of proxy selector
           if (isRunning && meta.trafficSnapshots) {
-            // Find the traffic snapshot for this profile by matching profile_id
             const snapshot = meta.trafficSnapshots[profile.id];
-            // Only use recent_bandwidth (last 60 seconds) - minimal data needed for mini chart
-            // Create a new array reference to ensure React detects changes
             const bandwidthData = snapshot?.recent_bandwidth
               ? [...snapshot.recent_bandwidth]
               : [];
@@ -1815,13 +2073,21 @@ export function ProfilesDataTable({
                             : "cursor-pointer hover:bg-accent/50",
                         )}
                       >
+                        {vpnBadge && (
+                          <Badge
+                            variant="outline"
+                            className="text-[10px] px-1 py-0 leading-tight"
+                          >
+                            {vpnBadge}
+                          </Badge>
+                        )}
                         <span
                           className={cn(
                             "text-sm",
-                            !profileHasProxy && "text-muted-foreground",
+                            !hasAssignment && "text-muted-foreground",
                           )}
                         >
-                          {profileHasProxy
+                          {hasAssignment
                             ? trimName(displayName, 10)
                             : displayName}
                         </span>
@@ -1840,9 +2106,19 @@ export function ProfilesDataTable({
                     sideOffset={8}
                   >
                     <Command>
-                      <CommandInput placeholder="Search proxies..." />
+                      <CommandInput
+                        placeholder={
+                          meta.canCreateLocationProxy
+                            ? "Search proxies, VPNs, or countries..."
+                            : "Search proxies or VPNs..."
+                        }
+                        onFocus={() => {
+                          if (meta.canCreateLocationProxy)
+                            void meta.loadCountries();
+                        }}
+                      />
                       <CommandList>
-                        <CommandEmpty>No proxies found.</CommandEmpty>
+                        <CommandEmpty>No proxies or VPNs found.</CommandEmpty>
                         <CommandGroup>
                           <CommandItem
                             value="__none__"
@@ -1853,12 +2129,12 @@ export function ProfilesDataTable({
                             <LuCheck
                               className={cn(
                                 "mr-2 h-4 w-4",
-                                effectiveProxyId === null
+                                selectedId === null
                                   ? "opacity-100"
                                   : "opacity-0",
                               )}
                             />
-                            No Proxy
+                            None
                           </CommandItem>
                           {meta.storedProxies.map((proxy) => (
                             <CommandItem
@@ -1874,7 +2150,7 @@ export function ProfilesDataTable({
                               <LuCheck
                                 className={cn(
                                   "mr-2 h-4 w-4",
-                                  effectiveProxyId === proxy.id
+                                  effectiveProxyId === proxy.id && !effectiveVpn
                                     ? "opacity-100"
                                     : "opacity-0",
                                 )}
@@ -1883,12 +2159,73 @@ export function ProfilesDataTable({
                             </CommandItem>
                           ))}
                         </CommandGroup>
+                        {meta.vpnConfigs.length > 0 && (
+                          <CommandGroup heading="VPNs">
+                            {meta.vpnConfigs.map((vpn) => (
+                              <CommandItem
+                                key={vpn.id}
+                                value={`vpn-${vpn.name}`}
+                                onSelect={() =>
+                                  void meta.handleVpnSelection(
+                                    profile.id,
+                                    vpn.id,
+                                  )
+                                }
+                              >
+                                <LuCheck
+                                  className={cn(
+                                    "mr-2 h-4 w-4",
+                                    effectiveVpnId === vpn.id
+                                      ? "opacity-100"
+                                      : "opacity-0",
+                                  )}
+                                />
+                                <Badge
+                                  variant="outline"
+                                  className="text-[10px] px-1 py-0 leading-tight mr-1"
+                                >
+                                  {vpn.vpn_type === "WireGuard" ? "WG" : "OVPN"}
+                                </Badge>
+                                {vpn.name}
+                              </CommandItem>
+                            ))}
+                          </CommandGroup>
+                        )}
+                        {meta.canCreateLocationProxy &&
+                          meta.countries.length > 0 && (
+                            <CommandGroup heading="Create by country">
+                              {meta.countries
+                                .filter(
+                                  (c) =>
+                                    !meta.storedProxies.some(
+                                      (p) =>
+                                        p.is_cloud_derived &&
+                                        p.geo_country === c.code,
+                                    ),
+                                )
+                                .map((country) => (
+                                  <CommandItem
+                                    key={`country-${country.code}`}
+                                    value={`create-${country.name}`}
+                                    onSelect={() =>
+                                      void meta.handleCreateCountryProxy(
+                                        profile.id,
+                                        country,
+                                      )
+                                    }
+                                  >
+                                    <span className="mr-2 h-4 w-4" />+{" "}
+                                    {country.name}
+                                  </CommandItem>
+                                ))}
+                            </CommandGroup>
+                          )}
                       </CommandList>
                     </Command>
                   </PopoverContent>
                 )}
               </Popover>
-              {profileHasProxy && effectiveProxy && !isDisabled && (
+              {effectiveProxy && !effectiveVpn && !isDisabled && (
                 <ProxyCheckButton
                   proxy={effectiveProxy}
                   profileId={profile.id}
@@ -1917,26 +2254,37 @@ export function ProfilesDataTable({
         id: "sync",
         header: "",
         size: 24,
-        cell: ({ row }) => {
+        cell: ({ row, table }) => {
           const profile = row.original;
+          const meta = table.options.meta as TableMeta;
+          const syncEntry = meta.syncStatuses[profile.id];
+          const liveStatus = syncEntry?.status as
+            | "syncing"
+            | "waiting"
+            | "synced"
+            | "error"
+            | "disabled"
+            | undefined;
 
-          if (!profile.sync_enabled && profile.last_sync) {
-            return (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="flex justify-center items-center w-3 h-3">
-                    <span className="w-2 h-2 rounded-full bg-orange-500" />
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent>
-                  Sync is disabled, last sync{" "}
-                  {formatRelativeTime(profile.last_sync)}
-                </TooltipContent>
-              </Tooltip>
-            );
-          }
+          const dot = getProfileSyncStatusDot(
+            profile,
+            liveStatus,
+            syncEntry?.error,
+          );
+          if (!dot) return null;
 
-          return null;
+          return (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="flex justify-center items-center w-3 h-3">
+                  <span
+                    className={`w-2 h-2 rounded-full ${dot.color}${dot.animate ? " animate-pulse" : ""}`}
+                  />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>{dot.tooltip}</TooltipContent>
+            </Tooltip>
+          );
         },
       },
       {
@@ -1944,14 +2292,14 @@ export function ProfilesDataTable({
         cell: ({ row, table }) => {
           const meta = table.options.meta as TableMeta;
           const profile = row.original;
+          const isCrossOs = isCrossOsProfile(profile);
           const isRunning =
             meta.isClient && meta.runningProfiles.has(profile.id);
-          const isBrowserUpdating =
-            meta.isClient && meta.isUpdating(profile.browser);
           const isLaunching = meta.launchingProfiles.has(profile.id);
           const isStopping = meta.stoppingProfiles.has(profile.id);
           const isDisabled =
-            isRunning || isLaunching || isStopping || isBrowserUpdating;
+            isRunning || isLaunching || isStopping || isCrossOs;
+          const isDeleteDisabled = isRunning || isLaunching || isStopping;
 
           return (
             <div className="flex justify-end items-center">
@@ -1971,16 +2319,27 @@ export function ProfilesDataTable({
                     onClick={() => {
                       meta.onOpenTrafficDialog?.(profile.id);
                     }}
+                    disabled={isCrossOs}
                   >
-                    View Network
+                    {meta.t("profiles.actions.viewNetwork")}
                   </DropdownMenuItem>
+                  {!profile.ephemeral && (
+                    <DropdownMenuItem
+                      onClick={() => {
+                        meta.onOpenProfileSyncDialog?.(profile);
+                      }}
+                      disabled={isCrossOs}
+                    >
+                      {meta.t("profiles.actions.syncSettings")}
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuItem
                     onClick={() => {
                       meta.onAssignProfilesToGroup?.([profile.id]);
                     }}
                     disabled={isDisabled}
                   >
-                    Assign to Group
+                    {meta.t("profiles.actions.assignToGroup")}
                   </DropdownMenuItem>
                   {(profile.browser === "camoufox" ||
                     profile.browser === "wayfern") &&
@@ -1989,36 +2348,64 @@ export function ProfilesDataTable({
                         onClick={() => {
                           meta.onConfigureCamoufox?.(profile);
                         }}
+                        disabled={isDisabled}
                       >
-                        Change Fingerprint
+                        {meta.t("profiles.actions.changeFingerprint")}
                       </DropdownMenuItem>
                     )}
                   {(profile.browser === "camoufox" ||
                     profile.browser === "wayfern") &&
+                    !profile.ephemeral &&
                     meta.onCopyCookiesToProfile && (
                       <DropdownMenuItem
                         onClick={() => {
-                          meta.onCopyCookiesToProfile?.(profile);
+                          if (meta.crossOsUnlocked) {
+                            meta.onCopyCookiesToProfile?.(profile);
+                          }
                         }}
+                        disabled={isDisabled || !meta.crossOsUnlocked}
                       >
-                        Copy Cookies to Profile
+                        <span className="flex items-center gap-2">
+                          {meta.t("profiles.actions.copyCookiesToProfile")}
+                          {!meta.crossOsUnlocked && <ProBadge />}
+                        </span>
                       </DropdownMenuItem>
                     )}
-                  <DropdownMenuItem
-                    onClick={() => {
-                      meta.onCloneProfile?.(profile);
-                    }}
-                    disabled={isDisabled}
-                  >
-                    Clone Profile
-                  </DropdownMenuItem>
+                  {(profile.browser === "camoufox" ||
+                    profile.browser === "wayfern") &&
+                    !profile.ephemeral &&
+                    meta.onOpenCookieManagement && (
+                      <DropdownMenuItem
+                        onClick={() => {
+                          if (meta.crossOsUnlocked) {
+                            meta.onOpenCookieManagement?.(profile);
+                          }
+                        }}
+                        disabled={isDisabled || !meta.crossOsUnlocked}
+                      >
+                        <span className="flex items-center gap-2">
+                          {meta.t("cookies.management.menuItem")}
+                          {!meta.crossOsUnlocked && <ProBadge />}
+                        </span>
+                      </DropdownMenuItem>
+                    )}
+                  {!profile.ephemeral && (
+                    <DropdownMenuItem
+                      onClick={() => {
+                        meta.onCloneProfile?.(profile);
+                      }}
+                      disabled={isDisabled}
+                    >
+                      {meta.t("profiles.actions.clone")}
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuItem
                     onClick={() => {
                       setProfileToDelete(profile);
                     }}
-                    disabled={isDisabled}
+                    disabled={isDeleteDisabled}
                   >
-                    Delete
+                    {meta.t("profiles.actions.delete")}
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -2045,8 +2432,7 @@ export function ProfilesDataTable({
         browserState.isClient && runningProfiles.has(profile.id);
       const isLaunching = launchingProfiles.has(profile.id);
       const isStopping = stoppingProfiles.has(profile.id);
-      const isBrowserUpdating = isUpdating(profile.browser);
-      return !isRunning && !isLaunching && !isStopping && !isBrowserUpdating;
+      return !isRunning && !isLaunching && !isStopping;
     },
     getSortedRowModel: getSortedRowModel(),
     getCoreRowModel: getCoreRowModel(),
@@ -2089,7 +2475,10 @@ export function ProfilesDataTable({
                 <TableRow
                   key={row.id}
                   data-state={row.getIsSelected() && "selected"}
-                  className="overflow-visible hover:bg-accent/50"
+                  className={cn(
+                    "overflow-visible hover:bg-accent/50",
+                    isCrossOsProfile(row.original) && "opacity-60",
+                  )}
                 >
                   {row.getVisibleCells().map((cell) => (
                     <TableCell key={cell.id} className="overflow-visible">
@@ -2145,9 +2534,10 @@ export function ProfilesDataTable({
         )}
         {onBulkCopyCookies && (
           <DataTableActionBarAction
-            tooltip="Copy Cookies"
+            tooltip={crossOsUnlocked ? "Copy Cookies" : "Copy Cookies (Pro)"}
             onClick={onBulkCopyCookies}
             size="icon"
+            disabled={!crossOsUnlocked}
           >
             <LuCookie />
           </DataTableActionBarAction>

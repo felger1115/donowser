@@ -1,4 +1,3 @@
-use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, create_dir_all};
 use std::path::PathBuf;
@@ -54,6 +53,8 @@ pub struct AppSettings {
   pub launch_on_login_declined: bool, // User permanently declined the launch-on-login prompt
   #[serde(default)]
   pub language: Option<String>, // ISO 639-1: "en", "es", "pt", "fr", "zh", "ja", "ru", or None for system default
+  #[serde(default)]
+  pub window_resize_warning_dismissed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -87,31 +88,16 @@ impl Default for AppSettings {
       mcp_token: None,
       launch_on_login_declined: false,
       language: None,
+      window_resize_warning_dismissed: false,
     }
   }
 }
 
-pub struct SettingsManager {
-  base_dirs: BaseDirs,
-  data_dir_override: Option<PathBuf>,
-}
+pub struct SettingsManager;
 
 impl SettingsManager {
-  fn new() -> Self {
-    Self {
-      base_dirs: BaseDirs::new().expect("Failed to get base directories"),
-      data_dir_override: std::env::var("DONUTBROWSER_DATA_DIR")
-        .ok()
-        .map(PathBuf::from),
-    }
-  }
-
-  #[cfg(test)]
-  fn with_data_dir_override(dir: &std::path::Path) -> Self {
-    Self {
-      base_dirs: BaseDirs::new().expect("Failed to get base directories"),
-      data_dir_override: Some(dir.to_path_buf()),
-    }
+  pub(crate) fn new() -> Self {
+    Self
   }
 
   pub fn instance() -> &'static SettingsManager {
@@ -119,18 +105,7 @@ impl SettingsManager {
   }
 
   pub fn get_settings_dir(&self) -> PathBuf {
-    if let Some(dir) = &self.data_dir_override {
-      return dir.join("settings");
-    }
-
-    let mut path = self.base_dirs.data_local_dir().to_path_buf();
-    path.push(if cfg!(debug_assertions) {
-      "DonutBrowserDev"
-    } else {
-      "DonutBrowser"
-    });
-    path.push("settings");
-    path
+    crate::app_dirs::settings_dir()
   }
 
   pub fn get_settings_file(&self) -> PathBuf {
@@ -809,6 +784,15 @@ pub async fn save_app_settings(
     settings.mcp_token = None;
   }
 
+  // Preserve server-managed flags that the frontend may not have up-to-date.
+  // Read directly from file to avoid load_settings' save-on-load behavior.
+  if let Ok(content) = std::fs::read_to_string(manager.get_settings_file()) {
+    if let Ok(current) = serde_json::from_str::<AppSettings>(&content) {
+      settings.window_resize_warning_dismissed = current.window_resize_warning_dismissed;
+      settings.launch_on_login_declined = current.launch_on_login_declined;
+    }
+  }
+
   let mut persist_settings = settings.clone();
   persist_settings.api_token = None;
   persist_settings.mcp_token = None;
@@ -870,6 +854,19 @@ pub async fn save_table_sorting_settings(sorting: TableSortingSettings) -> Resul
 
 #[tauri::command]
 pub async fn get_sync_settings(app_handle: tauri::AppHandle) -> Result<SyncSettings, String> {
+  // Cloud auth takes priority over self-hosted settings
+  if crate::cloud_auth::CLOUD_AUTH.is_logged_in().await {
+    let sync_token = crate::cloud_auth::CLOUD_AUTH
+      .get_or_refresh_sync_token()
+      .await
+      .map_err(|e| format!("Failed to get cloud sync token: {e}"))?;
+    return Ok(SyncSettings {
+      sync_server_url: Some(crate::cloud_auth::CLOUD_SYNC_URL.to_string()),
+      sync_token,
+    });
+  }
+
+  // Fall back to self-hosted settings
   let manager = SettingsManager::instance();
   let mut sync_settings = manager
     .get_sync_settings()
@@ -914,6 +911,27 @@ pub async fn save_sync_settings(
 }
 
 #[tauri::command]
+pub async fn dismiss_window_resize_warning() -> Result<(), String> {
+  let manager = SettingsManager::instance();
+  let mut settings = manager
+    .load_settings()
+    .map_err(|e| format!("Failed to load settings: {e}"))?;
+  settings.window_resize_warning_dismissed = true;
+  manager
+    .save_settings(&settings)
+    .map_err(|e| format!("Failed to save settings: {e}"))
+}
+
+#[tauri::command]
+pub async fn get_window_resize_warning_dismissed() -> Result<bool, String> {
+  let manager = SettingsManager::instance();
+  let settings = manager
+    .load_settings()
+    .map_err(|e| format!("Failed to load settings: {e}"))?;
+  Ok(settings.window_resize_warning_dismissed)
+}
+
+#[tauri::command]
 pub fn get_system_language() -> String {
   sys_locale::get_locale()
     .map(|locale| {
@@ -937,16 +955,16 @@ mod tests {
   use super::*;
   use tempfile::TempDir;
 
-  fn create_test_settings_manager() -> (SettingsManager, TempDir) {
+  fn create_test_settings_manager() -> (SettingsManager, TempDir, crate::app_dirs::TestDirGuard) {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let manager = SettingsManager::with_data_dir_override(temp_dir.path());
-    (manager, temp_dir)
+    let guard = crate::app_dirs::set_test_data_dir(temp_dir.path().to_path_buf());
+    let manager = SettingsManager::new();
+    (manager, temp_dir, guard)
   }
 
   #[test]
   fn test_settings_manager_creation() {
-    let (_manager, _temp_dir) = create_test_settings_manager();
-    // Test passes if no panic occurs
+    let (_manager, _temp_dir, _guard) = create_test_settings_manager();
   }
 
   #[test]
@@ -979,7 +997,7 @@ mod tests {
 
   #[test]
   fn test_load_settings_nonexistent_file() {
-    let (manager, _temp_dir) = create_test_settings_manager();
+    let (manager, _temp_dir, _guard) = create_test_settings_manager();
 
     let result = manager.load_settings();
     assert!(
@@ -997,7 +1015,7 @@ mod tests {
 
   #[test]
   fn test_save_and_load_settings() {
-    let (manager, _temp_dir) = create_test_settings_manager();
+    let (manager, _temp_dir, _guard) = create_test_settings_manager();
 
     let test_settings = AppSettings {
       set_as_default_browser: true,
@@ -1014,13 +1032,12 @@ mod tests {
       mcp_token: None,
       launch_on_login_declined: false,
       language: None,
+      window_resize_warning_dismissed: false,
     };
 
-    // Save settings
     let save_result = manager.save_settings(&test_settings);
     assert!(save_result.is_ok(), "Should save settings successfully");
 
-    // Load settings back
     let load_result = manager.load_settings();
     assert!(load_result.is_ok(), "Should load settings successfully");
 
@@ -1037,7 +1054,7 @@ mod tests {
 
   #[test]
   fn test_load_table_sorting_nonexistent_file() {
-    let (manager, _temp_dir) = create_test_settings_manager();
+    let (manager, _temp_dir, _guard) = create_test_settings_manager();
 
     let result = manager.load_table_sorting();
     assert!(
@@ -1052,18 +1069,16 @@ mod tests {
 
   #[test]
   fn test_save_and_load_table_sorting() {
-    let (manager, _temp_dir) = create_test_settings_manager();
+    let (manager, _temp_dir, _guard) = create_test_settings_manager();
 
     let test_sorting = TableSortingSettings {
       column: "browser".to_string(),
       direction: "desc".to_string(),
     };
 
-    // Save sorting
     let save_result = manager.save_table_sorting(&test_sorting);
     assert!(save_result.is_ok(), "Should save sorting successfully");
 
-    // Load sorting back
     let load_result = manager.load_table_sorting();
     assert!(load_result.is_ok(), "Should load sorting successfully");
 
@@ -1080,45 +1095,37 @@ mod tests {
 
   #[test]
   fn test_should_show_launch_on_login_prompt() {
-    let (manager, _temp_dir) = create_test_settings_manager();
+    let (manager, _temp_dir, _guard) = create_test_settings_manager();
 
     let result = manager.should_show_launch_on_login_prompt();
     assert!(result.is_ok(), "Should not fail");
 
-    // By default, should show prompt (not declined, autostart not enabled)
     let _should_show = result.unwrap();
-    // Note: The actual value depends on system autostart state, so we just test it doesn't fail
   }
 
   #[test]
   fn test_decline_launch_on_login() {
-    let (manager, _temp_dir) = create_test_settings_manager();
+    let (manager, _temp_dir, _guard) = create_test_settings_manager();
 
-    // Initially not declined
     let settings = manager.load_settings().unwrap();
     assert!(!settings.launch_on_login_declined);
 
-    // Decline
     manager.decline_launch_on_login().unwrap();
 
-    // Should be declined now
     let settings = manager.load_settings().unwrap();
     assert!(settings.launch_on_login_declined);
   }
 
   #[test]
   fn test_load_corrupted_settings_file() {
-    let (manager, _temp_dir) = create_test_settings_manager();
+    let (manager, _temp_dir, _guard) = create_test_settings_manager();
 
-    // Create settings directory
     let settings_dir = manager.get_settings_dir();
     fs::create_dir_all(&settings_dir).expect("Should create settings directory");
 
-    // Write corrupted JSON
     let settings_file = manager.get_settings_file();
     fs::write(&settings_file, "{ invalid json }").expect("Should write corrupted file");
 
-    // Should handle corrupted file gracefully
     let result = manager.load_settings();
     assert!(
       result.is_ok(),
@@ -1138,7 +1145,7 @@ mod tests {
 
   #[test]
   fn test_settings_file_paths() {
-    let (manager, _temp_dir) = create_test_settings_manager();
+    let (manager, _temp_dir, _guard) = create_test_settings_manager();
 
     let settings_dir = manager.get_settings_dir();
     let settings_file = manager.get_settings_file();
